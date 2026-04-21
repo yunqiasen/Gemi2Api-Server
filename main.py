@@ -15,7 +15,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 from urllib.parse import quote, urlparse
 
 import httpx
@@ -459,6 +459,90 @@ class ModelList(BaseModel):
 	data: List[ModelData]
 
 
+def get_runtime_available_models(client: Optional[GeminiClient]) -> List[Any]:
+	"""Return account-available Gemini models discovered at runtime."""
+	if client is None:
+		return []
+	try:
+		models = client.list_models()
+	except Exception as e:
+		logger.warning(f"Failed to inspect runtime model list: {e}")
+		return []
+
+	if not models:
+		return []
+
+	result = []
+	for model in models:
+		model_name = getattr(model, "model_name", "") or ""
+		if not model_name:
+			continue
+		if getattr(model, "is_available", True) is False:
+			continue
+		result.append(model)
+	return result
+
+
+def serialize_runtime_model(model: Any, now: int) -> Dict[str, Any]:
+	"""Convert a runtime AvailableModel into OpenAI-compatible model metadata."""
+	return {
+		"id": getattr(model, "model_name", ""),
+		"object": "model",
+		"created": now,
+		"owned_by": "google-gemini-web",
+		"display_name": getattr(model, "display_name", "") or getattr(model, "model_name", ""),
+		"description": getattr(model, "description", "") or "",
+		"advanced_only": bool(getattr(model, "advanced_only", False)),
+	}
+
+
+def score_runtime_model_match(model: Any, requested: str) -> int:
+	"""Best-effort score for mapping an OpenAI-style model name onto runtime Gemini models."""
+	requested = requested.lower().strip()
+	if not requested:
+		return -1
+
+	model_name = str(getattr(model, "model_name", "") or "").lower()
+	display_name = str(getattr(model, "display_name", "") or "").lower()
+	description = str(getattr(model, "description", "") or "").lower()
+	haystack = " ".join(part for part in [model_name, display_name, description] if part)
+
+	score = 0
+	if requested == model_name:
+		score += 1000
+	if requested == display_name:
+		score += 900
+	if requested in model_name:
+		score += 600
+	if requested in display_name:
+		score += 500
+	if requested in haystack:
+		score += 300
+
+	token_groups = [
+		(["thinking", "reasoning"], 160),
+		(["flash", "fast"], 140),
+		(["pro"], 140),
+		(["vision", "image"], 100),
+		(["video", "veo"], 100),
+		(["audio", "music"], 80),
+	]
+	for aliases, weight in token_groups:
+		if any(alias in requested for alias in aliases) and any(alias in haystack for alias in aliases):
+			score += weight
+
+	requested_tokens = [token for token in re.split(r"[^a-z0-9]+", requested) if token]
+	for token in requested_tokens:
+		if token in model_name:
+			score += 40
+		elif token in display_name:
+			score += 25
+		elif token in description:
+			score += 10
+
+	return score
+
+
 # Authentication dependency
 async def verify_api_key(authorization: str = Header(None)):
 	"""
@@ -518,24 +602,45 @@ async def error_handling(request: Request, call_next):
 # Get list of available models
 @app.get("/v1/models")
 async def list_models():
-	"""返回 gemini_webapi 中声明的模型列表"""
+	"""Return models discovered for the current account, falling back to static enum values."""
 	now = int(datetime.now(tz=timezone.utc).timestamp())
-	data = [
-		{
-			"id": m.model_name,  # 如 "gemini-2.0-flash"
-			"object": "model",
-			"created": now,
-			"owned_by": "google-gemini-web",
-		}
-		for m in Model
-	]
+	data: List[Dict[str, Any]] = []
+	try:
+		client = await get_gemini_client()
+		runtime_models = get_runtime_available_models(client)
+		if runtime_models:
+			data = [serialize_runtime_model(model, now) for model in runtime_models]
+	except Exception as e:
+		logger.warning(f"Falling back to static model list: {e}")
+
+	if not data:
+		data = [
+			{
+				"id": m.model_name,  # 如 "gemini-2.0-flash"
+				"object": "model",
+				"created": now,
+				"owned_by": "google-gemini-web",
+			}
+			for m in Model
+		]
 	return {"object": "list", "data": data}
 
 
 # Helper to convert between Gemini and OpenAI model names
-def map_model_name(openai_model_name: str) -> Model:
-	"""根据模型名称字符串查找匹配的 Model 枚举值"""
-	normalized_openai_model_name = openai_model_name.lower()
+def map_model_name(openai_model_name: str, runtime_models: Optional[List[Any]] = None) -> Union[Model, Any]:
+	"""Map an OpenAI-style model name onto a Gemini enum/runtime model."""
+	normalized_openai_model_name = (openai_model_name or "").lower().strip()
+
+	if runtime_models:
+		best_model = None
+		best_score = -1
+		for runtime_model in runtime_models:
+			score = score_runtime_model_match(runtime_model, normalized_openai_model_name)
+			if score > best_score:
+				best_score = score
+				best_model = runtime_model
+		if best_model is not None and best_score > 0:
+			return best_model
 
 	# 首先尝试直接查找匹配的模型名称
 	for m in Model:
@@ -723,6 +828,12 @@ def postprocess_text(text: str) -> str:
 	return correct_markdown(text)
 
 
+def get_signed_proxy_url(base_url: str, path: str, url: str) -> str:
+	"""Build a signed proxy URL for Google-hosted assets."""
+	sig = get_image_signature(url)
+	return f"{base_url}{path}?url={quote(url)}&sig={sig}"
+
+
 def extract_image_markdown(response, base_url: str) -> str:
 	"""Extract images from a response and return markdown image links."""
 	result = ""
@@ -730,10 +841,46 @@ def extract_image_markdown(response, base_url: str) -> str:
 		for img in response.images:
 			img_url = getattr(img, "url", None)
 			if img_url:
-				sig = get_image_signature(img_url)
-				proxy_url = f"{base_url}/gemini-proxy/image?url={quote(img_url)}&sig={sig}"
+				proxy_url = get_signed_proxy_url(base_url, "/gemini-proxy/image", img_url)
 				result += f"\n\n![🎨 Loading image...]({proxy_url})"
 	return result
+
+
+def extract_video_markdown(response, base_url: str) -> str:
+	"""Extract generated videos and return markdown links."""
+	result = ""
+	if hasattr(response, "videos") and response.videos:
+		for index, video in enumerate(response.videos, start=1):
+			video_url = getattr(video, "url", None)
+			if video_url:
+				proxy_url = get_signed_proxy_url(base_url, "/gemini-proxy/media", video_url)
+				result += f"\n\n[🎬 Video {index}]({proxy_url})"
+	return result
+
+
+def extract_media_markdown(response, base_url: str) -> str:
+	"""Extract generated audio/video media and return markdown links."""
+	result = ""
+	if hasattr(response, "media") and response.media:
+		for index, media in enumerate(response.media, start=1):
+			mp4_url = getattr(media, "url", None) or getattr(media, "mp4_url", None)
+			mp3_url = getattr(media, "mp3_url", None)
+			if mp4_url:
+				proxy_url = get_signed_proxy_url(base_url, "/gemini-proxy/media", mp4_url)
+				result += f"\n\n[🎥 Media Video {index}]({proxy_url})"
+			if mp3_url:
+				proxy_url = get_signed_proxy_url(base_url, "/gemini-proxy/media", mp3_url)
+				result += f"\n\n[🎵 Media Audio {index}]({proxy_url})"
+	return result
+
+
+def extract_asset_markdown(response, base_url: str) -> str:
+	"""Collect all non-text Gemini assets into markdown links."""
+	return (
+		extract_image_markdown(response, base_url)
+		+ extract_video_markdown(response, base_url)
+		+ extract_media_markdown(response, base_url)
+	)
 
 
 @app.post("/v1/chat/completions")
@@ -748,29 +895,28 @@ async def create_chat_completion(
 	and background conversation cleanup based on configuration.
 	"""
 	try:
-		# 确保客户端已初始化
 		global gemini_client
 		gemini_client = await get_gemini_client()
+		runtime_models = get_runtime_available_models(gemini_client)
 
-		# 转换消息为对话格式
 		conversation, temp_files = prepare_conversation(request.messages)
 		logger.info(
-			"Chat completion request: stream=%s requested_model=%s messages=%s temp_files=%s",
+			"Chat completion request: stream=%s requested_model=%s messages=%s temp_files=%s runtime_models=%s",
 			request.stream,
 			request.model,
 			len(request.messages),
 			len(temp_files),
+			len(runtime_models),
 		)
 
-		# 获取适当的模型
-		model = map_model_name(request.model)
+		model = map_model_name(request.model, runtime_models=runtime_models)
+		resolved_model_name = getattr(model, "model_name", None) or str(model)
+		logger.info("Resolved requested model '%s' -> '%s'", request.model, resolved_model_name)
 
-		# 创建响应对象
 		completion_id = f"chatcmpl-{uuid.uuid4()}"
 		created_time = int(time.time())
 		base_url = PUBLIC_BASE_URL or str(raw_request.base_url).rstrip("/")
 
-		# Prepare generate_content arguments
 		gen_kwargs = {"model": model}
 		if TEMPORARY_CHAT:
 			gen_kwargs["temporary"] = True
@@ -778,10 +924,9 @@ async def create_chat_completion(
 			gen_kwargs["files"] = temp_files
 
 		if request.stream:
-			# Real streaming using upstream generate_content_stream
 			async def generate_stream():
+				captured_cid = None
 				try:
-
 					def make_chunk(delta: dict, finish_reason=None):
 						return (
 							"data: "
@@ -803,14 +948,14 @@ async def create_chat_completion(
 							+ "\n\n"
 						)
 
-					# Send initial role chunk
 					yield make_chunk({"role": "assistant"})
 
 					thinking_started = False
 					thinking_ended = False
 					yielded_images = 0
+					yielded_videos = 0
+					yielded_media = 0
 					text_buffer = ""
-					captured_cid = None
 					chunk_count = 0
 					last_metadata = None
 
@@ -818,17 +963,13 @@ async def create_chat_completion(
 						chunk_count += 1
 						if hasattr(chunk, "metadata") and chunk.metadata:
 							last_metadata = chunk.metadata
-						# Capture conversation ID for auto-deletion
-						if AUTO_DELETE_CHAT and captured_cid is None and hasattr(chunk, "metadata") and chunk.metadata and len(chunk.metadata) > 0:
+						if AUTO_DELETE_CHAT and captured_cid is None and hasattr(chunk, "metadata") and chunk.metadata:
 							captured_cid = chunk.metadata[0]
 
-						# Handle thinking/thoughts delta
 						if ENABLE_THINKING and hasattr(chunk, "thoughts_delta") and chunk.thoughts_delta:
 							if not thinking_started:
 								yield make_chunk({"content": "<think>\n"})
 								thinking_started = True
-
-							# Also include reasoning_content for full Open WebUI native compatibility
 							yield make_chunk(
 								{
 									"content": chunk.thoughts_delta,
@@ -836,17 +977,13 @@ async def create_chat_completion(
 								}
 							)
 
-						# Handle text delta
 						if hasattr(chunk, "text_delta") and chunk.text_delta:
-							# Close thinking tag before first text content
 							if thinking_started and not thinking_ended:
 								thinking_ended = True
 								yield make_chunk({"content": "\n</think>\n\n"})
 
 							text_buffer += chunk.text_delta
 							safe_to_yield = False
-
-							# Yield if buffer ends with whitespace and looks like it's outside a markdown link
 							if (
 								text_buffer[-1].isspace()
 								and text_buffer.count("[") == text_buffer.count("]")
@@ -860,55 +997,64 @@ async def create_chat_completion(
 								yield make_chunk({"content": postprocess_text(text_buffer)})
 								text_buffer = ""
 
-						# Handle inline images as they arrive
 						if hasattr(chunk, "images") and chunk.images and len(chunk.images) > yielded_images:
-							# Close thinking tag if an image arrives before any text
 							if thinking_started and not thinking_ended:
 								thinking_ended = True
 								yield make_chunk({"content": "\n</think>\n\n"})
 
-							new_images = chunk.images[yielded_images:]
-							for img in new_images:
+							for img in chunk.images[yielded_images:]:
 								img_url = getattr(img, "url", None)
 								if img_url:
-									sig = get_image_signature(img_url)
-									proxy_url = f"{base_url}/gemini-proxy/image?url={quote(img_url)}&sig={sig}"
-									img_md = f"\n\n![🎨 Loading image...]({proxy_url})\n\n"
-									yield make_chunk({"content": img_md})
+									proxy_url = get_signed_proxy_url(base_url, "/gemini-proxy/image", img_url)
+									yield make_chunk({"content": f"\n\n![🎨 Loading image...]({proxy_url})\n\n"})
 							yielded_images = len(chunk.images)
 
-					# Flush any remaining text
+						if hasattr(chunk, "videos") and chunk.videos and len(chunk.videos) > yielded_videos:
+							for idx, video in enumerate(chunk.videos[yielded_videos:], start=yielded_videos + 1):
+								video_url = getattr(video, "url", None)
+								if video_url:
+									proxy_url = get_signed_proxy_url(base_url, "/gemini-proxy/media", video_url)
+									yield make_chunk({"content": f"\n\n[🎬 Video {idx}]({proxy_url})\n\n"})
+							yielded_videos = len(chunk.videos)
+
+						if hasattr(chunk, "media") and chunk.media and len(chunk.media) > yielded_media:
+							for idx, media in enumerate(chunk.media[yielded_media:], start=yielded_media + 1):
+								mp4_url = getattr(media, "url", None) or getattr(media, "mp4_url", None)
+								mp3_url = getattr(media, "mp3_url", None)
+								if mp4_url:
+									proxy_url = get_signed_proxy_url(base_url, "/gemini-proxy/media", mp4_url)
+									yield make_chunk({"content": f"\n\n[🎥 Media Video {idx}]({proxy_url})\n\n"})
+								if mp3_url:
+									proxy_url = get_signed_proxy_url(base_url, "/gemini-proxy/media", mp3_url)
+									yield make_chunk({"content": f"\n\n[🎵 Media Audio {idx}]({proxy_url})\n\n"})
+							yielded_media = len(chunk.media)
+
 					if text_buffer:
 						yield make_chunk({"content": postprocess_text(text_buffer)})
-
-					# Close thinking tag if it was never closed
 					if thinking_started and not thinking_ended:
 						yield make_chunk({"content": "\n</think>\n\n"})
 
-					# Send finish chunk
 					yield make_chunk({}, finish_reason="stop")
 					yield "data: [DONE]\n\n"
 
 					logger.info(
-						"Streaming response completed: chunks=%s images=%s",
+						"Streaming response completed: chunks=%s images=%s videos=%s media=%s",
 						chunk_count,
 						yielded_images,
+						yielded_videos,
+						yielded_media,
 					)
 					if last_metadata and len(last_metadata) > 0 and not AUTO_DELETE_CHAT:
 						asyncio.create_task(background_verify_chat_persistence(gemini_client, last_metadata[0], "stream"))
 				except Exception as e:
 					logger.error(f"Error during streaming: {str(e)}", exc_info=True)
-					# Send error as a content chunk so the client sees it
 					error_msg = "\n\n[An internal error occurred while streaming]"
 					yield make_chunk({"content": error_msg})
 					yield make_chunk({}, finish_reason="stop")
 					yield "data: [DONE]\n\n"
 				finally:
-					# Create background task to delete the chat if AUTO_DELETE_CHAT is enabled
 					if AUTO_DELETE_CHAT and captured_cid:
 						asyncio.create_task(background_delete_chat(gemini_client, captured_cid))
-
-					# 清理临时文件
 					for temp_file in temp_files:
 						try:
 							os.unlink(temp_file)
@@ -916,86 +1062,78 @@ async def create_chat_completion(
 							logger.warning(f"Failed to delete temp file {temp_file}: {str(e)}")
 
 			return StreamingResponse(generate_stream(), media_type="text/event-stream")
+
+		try:
+			response = await gemini_client.generate_content(conversation, **gen_kwargs)
+			if AUTO_DELETE_CHAT and hasattr(response, "metadata") and response.metadata and len(response.metadata) > 0:
+				cid = response.metadata[0]
+				asyncio.create_task(background_delete_chat(gemini_client, cid))
+			elif hasattr(response, "metadata") and response.metadata and len(response.metadata) > 0:
+				asyncio.create_task(background_verify_chat_persistence(gemini_client, response.metadata[0], "non-stream"))
+			elif not getattr(response, "metadata", None):
+				logger.warning("Non-stream response returned no Gemini metadata. This request may not map to a persistent Gemini chat.")
+		finally:
+			for temp_file in temp_files:
+				try:
+					os.unlink(temp_file)
+				except Exception as e:
+					logger.warning(f"Failed to delete temp file {temp_file}: {str(e)}")
+
+		reply_text = ""
+		if ENABLE_THINKING and hasattr(response, "thoughts") and response.thoughts:
+			reply_text += f"<think>\n{response.thoughts}\n</think>\n\n"
+		if hasattr(response, "text"):
+			reply_text += response.text
 		else:
-			# Non-streaming response
-			try:
-				response = await gemini_client.generate_content(conversation, **gen_kwargs)
+			reply_text += str(response)
 
-				if AUTO_DELETE_CHAT and hasattr(response, "metadata") and response.metadata and len(response.metadata) > 0:
-					cid = response.metadata[0]
-					asyncio.create_task(background_delete_chat(gemini_client, cid))
-				elif hasattr(response, "metadata") and response.metadata and len(response.metadata) > 0:
-					asyncio.create_task(background_verify_chat_persistence(gemini_client, response.metadata[0], "non-stream"))
-				elif not getattr(response, "metadata", None):
-					logger.warning("Non-stream response returned no Gemini metadata. This request may not map to a persistent Gemini chat.")
+		reply_text += extract_asset_markdown(response, base_url)
+		reply_text = postprocess_text(reply_text)
 
-			finally:
-				# 清理临时文件
-				for temp_file in temp_files:
-					try:
-						os.unlink(temp_file)
-					except Exception as e:
-						logger.warning(f"Failed to delete temp file {temp_file}: {str(e)}")
+		if not reply_text or reply_text.strip() == "":
+			logger.warning("Empty response received from Gemini")
+			reply_text = "Server returned an empty response. Please check that Gemini API credentials are valid."
 
-			# 提取文本响应
-			reply_text = ""
-			if ENABLE_THINKING and hasattr(response, "thoughts") and response.thoughts:
-				reply_text += f"<think>\n{response.thoughts}\n</think>\n\n"
-			if hasattr(response, "text"):
-				reply_text += response.text
-			else:
-				reply_text += str(response)
+		result = {
+			"id": completion_id,
+			"object": "chat.completion",
+			"created": created_time,
+			"model": request.model,
+			"choices": [
+				{
+					"index": 0,
+					"message": {"role": "assistant", "content": reply_text},
+					"finish_reason": "stop",
+				}
+			],
+			"usage": {
+				"prompt_tokens": len(conversation.split()),
+				"completion_tokens": len(reply_text.split()),
+				"total_tokens": len(conversation.split()) + len(reply_text.split()),
+			},
+		}
 
-			# 提取并追加图片响应
-			reply_text += extract_image_markdown(response, base_url)
-			reply_text = postprocess_text(reply_text)
-
-			if not reply_text or reply_text.strip() == "":
-				logger.warning("Empty response received from Gemini")
-				reply_text = "Server returned an empty response. Please check that Gemini API credentials are valid."
-
-			result = {
-				"id": completion_id,
-				"object": "chat.completion",
-				"created": created_time,
-				"model": request.model,
-				"choices": [
-					{
-						"index": 0,
-						"message": {"role": "assistant", "content": reply_text},
-						"finish_reason": "stop",
-					}
-				],
-				"usage": {
-					"prompt_tokens": len(conversation.split()),
-					"completion_tokens": len(reply_text.split()),
-					"total_tokens": len(conversation.split()) + len(reply_text.split()),
-				},
-			}
-
-			logger.info("Non-streaming response completed")
-			return result
+		logger.info("Non-streaming response completed")
+		return result
 
 	except Exception as e:
 		logger.error(f"Error generating completion: {str(e)}", exc_info=True)
 		raise HTTPException(status_code=500, detail=f"Error generating completion: {str(e)}")
 
 
-@app.get("/gemini-proxy/image")
-async def proxy_image(url: str, sig: str):
-	"""
-	Proxy images from Google domains to bypass browser security policies.
-	Requires a valid HMAC signature.
-	"""
-	# Verify signature
+ALLOWED_PROXY_DOMAINS = ["google.com", "googleusercontent.com", "gstatic.com"]
+IMAGE_PROXY_MAX_BYTES = 10 * 1024 * 1024
+MEDIA_PROXY_MAX_BYTES = 100 * 1024 * 1024
+
+
+def verify_proxy_signature(url: str, sig: str):
 	expected_sig = get_image_signature(url)
 	if not hmac.compare_digest(sig, expected_sig):
 		logger.warning(f"Invalid signature for proxy request: {url}")
 		raise HTTPException(status_code=403, detail="Invalid signature")
 
-	# Prevent open proxying
-	allowed_domains = ["google.com", "googleusercontent.com", "gstatic.com"]
 
+def validate_proxy_target(url: str):
 	try:
 		parsed = urlparse(url)
 		if parsed.scheme not in ["http", "https"]:
@@ -1008,8 +1146,7 @@ async def proxy_image(url: str, sig: str):
 			raise HTTPException(status_code=400, detail="Invalid URL")
 
 		hostname = hostname.lower()
-		is_allowed = any(hostname == d or hostname.endswith("." + d) for d in allowed_domains)
-
+		is_allowed = any(hostname == d or hostname.endswith("." + d) for d in ALLOWED_PROXY_DOMAINS)
 		if not is_allowed:
 			logger.warning(f"Blocked proxy request for domain: {hostname}")
 			raise HTTPException(status_code=403, detail="Domain not allowed")
@@ -1017,59 +1154,72 @@ async def proxy_image(url: str, sig: str):
 		logger.warning(f"Malformed URL in proxy request: {url}")
 		raise HTTPException(status_code=400, detail="Invalid URL")
 
-	# Minimal browser-like headers
-	headers = {
-		"User-Agent": DEFAULT_USER_AGENT,
-		"Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-		"Accept-Language": "en-US,en;q=0.9",
-		"Referer": "https://gemini.google.com/",
-	}
 
-	# 10MB limit
-	MAX_BYTES = 10 * 1024 * 1024
-
-	# Use scoped cookies to prevent leakage during redirects
+def build_proxy_cookie_jar() -> httpx.Cookies:
 	jar = httpx.Cookies()
-
-	# Use the freshest available 1PSIDTS without overriding env cookies up front.
 	psid = SECURE_1PSID
 	psidts = get_cookie_value(getattr(gemini_client, "cookies", None), "__Secure-1PSIDTS") or load_cached_1psidts(psid) or SECURE_1PSIDTS
-
 	jar.set("__Secure-1PSID", psid, domain=".google.com")
 	jar.set("__Secure-1PSIDTS", psidts, domain=".google.com")
 	jar.set("__Secure-1PSID", psid, domain=".googleusercontent.com")
 	jar.set("__Secure-1PSIDTS", psidts, domain=".googleusercontent.com")
+	return jar
+
+
+async def proxy_google_asset(
+	url: str,
+	*,
+	accept: str,
+	timeout: float,
+	max_bytes: int,
+	default_media_type: str,
+	ensure_full_size_image: bool = False,
+	remove_watermark: bool = False,
+) -> Response:
+	validate_proxy_target(url)
+
+	headers = {
+		"User-Agent": DEFAULT_USER_AGENT,
+		"Accept": accept,
+		"Accept-Language": "en-US,en;q=0.9",
+		"Referer": "https://gemini.google.com/",
+	}
+	jar = build_proxy_cookie_jar()
+	fetch_url = url
+	if ensure_full_size_image:
+		fetch_url = re.sub(r"=s\d+$", "=s0", url) if re.search(r"=s\d+$", url) else url + "=s0"
 
 	async with httpx.AsyncClient(http2=True, cookies=jar, follow_redirects=True) as client:
 		try:
-			# Fetch original resolution to keep watermark at expected size/position
-			fetch_url = re.sub(r"=s\d+$", "=s0", url) if re.search(r"=s\d+$", url) else url + "=s0"
-
-			async with client.stream("GET", fetch_url, timeout=15.0, headers=headers) as resp:
+			async with client.stream("GET", fetch_url, timeout=timeout, headers=headers) as resp:
 				if resp.status_code != 200:
-					logger.error(f"Google returned {resp.status_code} for image: {url}")
-
+					logger.error(f"Google returned {resp.status_code} for asset: {url}")
 				resp.raise_for_status()
 
 				content = bytearray()
 				async for chunk in resp.aiter_bytes():
 					content.extend(chunk)
-					if len(content) > MAX_BYTES:
-						logger.warning(f"Image too large: {url} (exceeded {MAX_BYTES} bytes)")
-						raise HTTPException(status_code=413, detail="Image too large")
-				# Validate Content-Type to prevent XSS/MIME sniffing
-				upstream_content_type = resp.headers.get("content-type", "image/png").lower()
-				if not upstream_content_type.startswith("image/"):
-					logger.warning(f"Rejected non-image Content-Type: {upstream_content_type} for {url}")
-					media_type = "image/png"
-				else:
-					media_type = upstream_content_type
+					if len(content) > max_bytes:
+						logger.warning(f"Asset too large: {url} (exceeded {max_bytes} bytes)")
+						raise HTTPException(status_code=413, detail="Asset too large")
 
-				# Process watermark removal
-				if media_type in ["image/png", "image/jpeg", "image/webp"]:
-					processed_content = remove_gemini_watermark(bytes(content))
+				upstream_content_type = resp.headers.get("content-type", default_media_type).lower()
+				if remove_watermark:
+					if not upstream_content_type.startswith("image/"):
+						logger.warning(f"Rejected non-image Content-Type: {upstream_content_type} for {url}")
+						media_type = default_media_type
+					else:
+						media_type = upstream_content_type
 				else:
-					processed_content = bytes(content)
+					if upstream_content_type.startswith(("video/", "audio/", "image/")):
+						media_type = upstream_content_type
+					else:
+						logger.warning(f"Unexpected media Content-Type: {upstream_content_type} for {url}")
+						media_type = default_media_type
+
+				processed_content = bytes(content)
+				if remove_watermark and media_type in ["image/png", "image/jpeg", "image/webp"]:
+					processed_content = remove_gemini_watermark(processed_content)
 
 				return Response(
 					content=processed_content,
@@ -1077,21 +1227,49 @@ async def proxy_image(url: str, sig: str):
 					headers={
 						"Cross-Origin-Resource-Policy": "cross-origin",
 						"Access-Control-Allow-Origin": "*",
-						"Cache-Control": "public, max-age=86400",  # Cache for 24 hours
+						"Cache-Control": "public, max-age=86400",
 						"X-Content-Type-Options": "nosniff",
 					},
 				)
 		except httpx.HTTPStatusError as e:
-			logger.error(f"Failed to fetch image: {e.response.status_code} for {url}")
+			logger.error(f"Failed to fetch asset: {e.response.status_code} for {url}")
 			raise HTTPException(
 				status_code=e.response.status_code,
-				detail=f"Failed to fetch image: Google returned {e.response.status_code}",
+				detail=f"Failed to fetch asset: Google returned {e.response.status_code}",
 			)
 		except HTTPException:
 			raise
 		except Exception as e:
 			logger.error(f"Proxy error: {str(e)}")
 			raise HTTPException(status_code=500, detail="Internal proxy error")
+
+
+@app.get("/gemini-proxy/image")
+async def proxy_image(url: str, sig: str):
+	"""Proxy images from Google domains and remove Gemini watermark when possible."""
+	verify_proxy_signature(url, sig)
+	return await proxy_google_asset(
+		url,
+		accept="image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+		timeout=15.0,
+		max_bytes=IMAGE_PROXY_MAX_BYTES,
+		default_media_type="image/png",
+		ensure_full_size_image=True,
+		remove_watermark=True,
+	)
+
+
+@app.get("/gemini-proxy/media")
+async def proxy_media(url: str, sig: str):
+	"""Proxy Google-hosted audio/video assets using authenticated Gemini cookies."""
+	verify_proxy_signature(url, sig)
+	return await proxy_google_asset(
+		url,
+		accept="video/*,audio/*,application/octet-stream;q=0.9,*/*;q=0.5",
+		timeout=30.0,
+		max_bytes=MEDIA_PROXY_MAX_BYTES,
+		default_media_type="application/octet-stream",
+	)
 
 
 @app.get("/")
