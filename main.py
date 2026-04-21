@@ -1166,6 +1166,15 @@ def build_proxy_cookie_jar() -> httpx.Cookies:
 	return jar
 
 
+def build_proxy_headers(accept: str) -> Dict[str, str]:
+	return {
+		"User-Agent": DEFAULT_USER_AGENT,
+		"Accept": accept,
+		"Accept-Language": "en-US,en;q=0.9",
+		"Referer": "https://gemini.google.com/",
+	}
+
+
 async def proxy_google_asset(
 	url: str,
 	*,
@@ -1177,13 +1186,7 @@ async def proxy_google_asset(
 	remove_watermark: bool = False,
 ) -> Response:
 	validate_proxy_target(url)
-
-	headers = {
-		"User-Agent": DEFAULT_USER_AGENT,
-		"Accept": accept,
-		"Accept-Language": "en-US,en;q=0.9",
-		"Referer": "https://gemini.google.com/",
-	}
+	headers = build_proxy_headers(accept)
 	jar = build_proxy_cookie_jar()
 	fetch_url = url
 	if ensure_full_size_image:
@@ -1244,6 +1247,86 @@ async def proxy_google_asset(
 			raise HTTPException(status_code=500, detail="Internal proxy error")
 
 
+async def stream_google_media_asset(
+	url: str,
+	*,
+	accept: str,
+	timeout: float,
+	max_bytes: int,
+	default_media_type: str,
+) -> StreamingResponse:
+	"""Stream media assets without buffering the entire file in memory."""
+	validate_proxy_target(url)
+	headers = build_proxy_headers(accept)
+	jar = build_proxy_cookie_jar()
+	client = httpx.AsyncClient(http2=True, cookies=jar, follow_redirects=True)
+
+	try:
+		request = client.build_request("GET", url, headers=headers)
+		resp = await client.send(request, stream=True)
+		if resp.status_code != 200:
+			logger.error(f"Google returned {resp.status_code} for media asset: {url}")
+		resp.raise_for_status()
+
+		upstream_content_type = resp.headers.get("content-type", default_media_type).lower()
+		if upstream_content_type.startswith(("video/", "audio/", "image/")):
+			media_type = upstream_content_type
+		else:
+			logger.warning(f"Unexpected media Content-Type: {upstream_content_type} for {url}")
+			media_type = default_media_type
+
+		content_length_header = resp.headers.get("content-length")
+		content_length = None
+		if content_length_header:
+			try:
+				content_length = int(content_length_header)
+			except ValueError:
+				content_length = None
+		if content_length is not None and content_length > max_bytes:
+			await resp.aclose()
+			await client.aclose()
+			logger.warning(f"Media asset too large by content-length: {url} ({content_length}>{max_bytes})")
+			raise HTTPException(status_code=413, detail="Asset too large")
+
+		response_headers = {
+			"Cross-Origin-Resource-Policy": "cross-origin",
+			"Access-Control-Allow-Origin": "*",
+			"Cache-Control": "public, max-age=86400",
+			"X-Content-Type-Options": "nosniff",
+		}
+		if content_length is not None:
+			response_headers["Content-Length"] = str(content_length)
+
+		async def iter_bytes():
+			total = 0
+			try:
+				async for chunk in resp.aiter_bytes():
+					total += len(chunk)
+					if total > max_bytes:
+						logger.warning(f"Media asset exceeded streaming limit: {url} ({total}>{max_bytes})")
+						break
+					yield chunk
+			finally:
+				await resp.aclose()
+				await client.aclose()
+
+		return StreamingResponse(iter_bytes(), media_type=media_type, headers=response_headers)
+	except httpx.HTTPStatusError as e:
+		await client.aclose()
+		logger.error(f"Failed to fetch media asset: {e.response.status_code} for {url}")
+		raise HTTPException(
+			status_code=e.response.status_code,
+			detail=f"Failed to fetch asset: Google returned {e.response.status_code}",
+		)
+	except HTTPException:
+		await client.aclose()
+		raise
+	except Exception as e:
+		await client.aclose()
+		logger.error(f"Media proxy error: {str(e)}")
+		raise HTTPException(status_code=500, detail="Internal proxy error")
+
+
 @app.get("/gemini-proxy/image")
 async def proxy_image(url: str, sig: str):
 	"""Proxy images from Google domains and remove Gemini watermark when possible."""
@@ -1263,7 +1346,7 @@ async def proxy_image(url: str, sig: str):
 async def proxy_media(url: str, sig: str):
 	"""Proxy Google-hosted audio/video assets using authenticated Gemini cookies."""
 	verify_proxy_signature(url, sig)
-	return await proxy_google_asset(
+	return await stream_google_media_asset(
 		url,
 		accept="video/*,audio/*,application/octet-stream;q=0.9,*/*;q=0.5",
 		timeout=30.0,
