@@ -19,11 +19,11 @@
 ```properties
 SECURE_1PSID = "COOKIE VALUE HERE"
 SECURE_1PSIDTS = "COOKIE VALUE HERE"
-API_KEY= "API_KEY VALUE HERE"
+API_KEY= "sk-your-own-token" # 这是你给本服务设置的 Bearer Token，不是 Google 提供的 Key，可自定义。
 TEMPORARY_CHAT = "false" # 使用临时对话模式，此模式会禁用部分功能如思考、图片生成等，默认关闭。
 AUTO_DELETE_CHAT = "false" # 低噪音模式建议关闭，避免每次请求额外发 delete 请求。TEMPORARY_CHAT为true时，此项无效。
 GEMINI_MAX_CONCURRENT = "1" # 单账号建议保持 1，避免同一 IP / 同一会话并发过高触发风控。
-PUBLIC_BASE_URL = "https://your-domain.com" # 外部URL，用于生成图片代理链接，不填则会使用内部地址。使用反向代理时必填，否则可能导致图片无法访问。
+PUBLIC_BASE_URL = "" # 本地测试请留空；只有挂了反向代理/公网域名时才填写外部地址。
 ```
 1. `uv` 安装一下依赖
 > uv init
@@ -41,8 +41,11 @@ PUBLIC_BASE_URL = "https://your-domain.com" # 外部URL，用于生成图片代�
 2. 激活一下环境
 > source venv/bin/activate
 
-3. 启动
-> uvicorn main:app --reload --host 127.0.0.1 --port 8000
+3. 启动（推荐直接让 `uvicorn` 读取 `.env`）
+> uvicorn main:app --env-file .env --reload --host 127.0.0.1 --port 8000
+
+> [!NOTE]
+> 当前 `main.py` 是直接读取 `os.environ`，不会自动加载 `.env`。如果不用 `--env-file .env`，那就需要先手动 `source .env` 再启动。
 
 > [!WARNING] 
 > tips: 如果不填写 API_KEY ，那么就直接使用
