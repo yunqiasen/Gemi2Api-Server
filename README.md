@@ -147,6 +147,142 @@ docker-compose up -d --build
 curl -s http://127.0.0.1:8000/v1/models | python3 -m json.tool
 ```
 
+## 接口使用示例
+
+### 文本模型
+
+```bash
+curl -s http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer sk-your-own-token' \
+  -d '{
+    "model": "gemini-3-flash",
+    "messages": [
+      {"role": "user", "content": "Reply with exactly OK."}
+    ]
+  }' | python3 -m json.tool
+```
+
+### 流式文本
+
+```bash
+curl -N http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer sk-your-own-token' \
+  -d '{
+    "model": "gemini-3-flash",
+    "stream": true,
+    "messages": [
+      {"role": "user", "content": "用三句话介绍你自己"}
+    ]
+  }'
+```
+
+### 生图模型
+
+如果你的账号在 `/v1/models` 里动态暴露了 image / vision 类模型，可以直接这样请求：
+
+```bash
+curl -s http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer sk-your-own-token' \
+  -d '{
+    "model": "你的生图模型ID",
+    "messages": [
+      {"role": "user", "content": "Generate a cyberpunk cat image"}
+    ]
+  }' | python3 -m json.tool
+```
+
+返回里会出现：
+
+```markdown
+![🎨 Loading image...](http://127.0.0.1:8000/gemini-proxy/image?... )
+```
+
+### 视频 / 音频模型
+
+如果你的账号动态暴露了 video / veo / audio / music 类模型，请求方式一样：
+
+```bash
+curl -s http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer sk-your-own-token' \
+  -d '{
+    "model": "你的视频或音频模型ID",
+    "messages": [
+      {"role": "user", "content": "Generate a short video of a cat playing"}
+    ]
+  }' | python3 -m json.tool
+```
+
+返回里会出现：
+
+```markdown
+[🎬 Video 1](http://127.0.0.1:8000/gemini-proxy/media?... )
+[🎵 Media Audio 1](http://127.0.0.1:8000/gemini-proxy/media?... )
+```
+
+## 下载与去水印说明（按源码）
+
+### 图片
+
+- `GET /gemini-proxy/image` 会走 `remove_watermark=True`
+- 当前只对这些格式执行去水印：
+  - `image/png`
+  - `image/jpeg`
+  - `image/webp`
+- 也就是说：**如果你下载的是服务端返回的代理图片链接，那么保存到本地的是去水印后的版本**
+
+示例下载：
+
+```bash
+curl -L 'http://127.0.0.1:8000/gemini-proxy/image?url=...&sig=...' -o image.png
+```
+
+### 视频 / 音频
+
+- `GET /gemini-proxy/media` 只是流式透传媒体内容
+- **不会做视频去水印**
+- **不会做音频去水印**
+
+示例下载：
+
+```bash
+curl -L 'http://127.0.0.1:8000/gemini-proxy/media?url=...&sig=...' -o video.mp4
+```
+
+## 上游 Gemini-API 原本写了什么
+
+上游 [HanaokaYuzu/Gemini-API](https://github.com/HanaokaYuzu/Gemini-API) 的 README 和源码里，明确写了这些原生能力：
+
+- 初始化后会后台自动刷新 `__Secure-1PSIDTS`
+- `GeminiClient.generate_content()`：单轮问答
+- `GeminiClient.start_chat()` / `ChatSession.send_message()`：多轮对话
+- `GeminiClient.list_models()`：动态列出当前账号可用模型
+- `Image.save()`：保存图片到本地
+- `GeneratedVideo.save()`：保存视频到本地
+- `GeneratedMedia.save(download_type=\"audio\" | \"video\" | \"both\")`：保存音频/视频到本地
+- `cli.py` 内置命令：
+  - `ask`
+  - `reply`
+  - `research`
+  - `list`
+  - `read`
+  - `models`
+  - `download`
+  - `inspect`
+
+上游 CLI 示例（原 README 有写）：
+
+```bash
+python cli.py --cookies-json cookies.json ask "What is quantum computing?"
+python cli.py --cookies-json cookies.json reply c_abc123 "Tell me more"
+python cli.py --cookies-json cookies.json models
+python cli.py --cookies-json cookies.json download "https://..." -o output.png
+python cli.py --cookies-json cookies.json inspect
+```
+
 ## 常见问题
 
 ### 服务器报 500 问题解决方案
