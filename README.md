@@ -21,7 +21,7 @@ SECURE_1PSID = "COOKIE VALUE HERE"
 SECURE_1PSIDTS = "COOKIE VALUE HERE"
 API_KEY= "API_KEY VALUE HERE"
 TEMPORARY_CHAT = "false" # 使用临时对话模式，此模式会禁用部分功能如思考、图片生成等，默认关闭。
-AUTO_DELETE_CHAT = "true" # 生成结束后自动从web端删除对话记录，默认开启。TEMPORARY_CHAT为true时，此项无效。
+AUTO_DELETE_CHAT = "false" # 低噪音模式建议关闭，避免每次请求额外发 delete 请求。TEMPORARY_CHAT为true时，此项无效。
 PUBLIC_BASE_URL = "https://your-domain.com" # 外部URL，用于生成图片代理链接，不填则会使用内部地址。使用反向代理时必填，否则可能导致图片无法访问。
 ```
 1. `uv` 安装一下依赖
@@ -95,7 +95,7 @@ docker-compose up -d --build
 
 ### 服务器报 500 问题解决方案
 
-500 的问题一般是 IP 不太行 或者 请求太频繁（后者等待一段时间或者重新新建一个隐身标签登录一下重新给 Secure_1PSID 和 Secure_1PSIDTS 即可），见 issue：
+500 的问题一般是 IP 不太行 或者 请求太频繁（后者等待一段时间或者重新新建一个隐身标签登录一下重新给 Secure_1PSID 和 Secure_1PSIDTS 即可）。当前版本只维护你手工提供的这两个 Cookie：运行期间依赖 `gemini-webapi` 后台自动刷新 `__Secure-1PSIDTS`，并把最新值同步到 `secrets/.cached_1psidts_<psid>.txt`，重启后优先复用这个刷新结果。见 issue：
 - [__Secure-1PSIDTS · Issue #6 · HanaokaYuzu/Gemini-API](https://github.com/HanaokaYuzu/Gemini-API/issues/6)
 - [Failed to initialize client. SECURE_1PSIDTS could get expired frequently · Issue #72 · HanaokaYuzu/Gemini-API](https://github.com/HanaokaYuzu/Gemini-API/issues/72)
 

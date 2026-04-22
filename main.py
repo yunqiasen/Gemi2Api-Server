@@ -39,14 +39,14 @@ gemini_client_lock = asyncio.Lock()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-	"""Initialize the Gemini client during startup and close it on shutdown."""
-	await get_gemini_client()
+	"""Lazily initialize the Gemini client on first request and close it on shutdown."""
 	try:
 		yield
 	finally:
 		global gemini_client
 		if gemini_client is not None:
 			try:
+				sync_cached_1psidts_from_client(gemini_client)
 				await gemini_client.close()
 			except Exception as e:
 				logger.warning(f"Failed to close Gemini client during shutdown: {e}")
@@ -89,6 +89,38 @@ def load_cached_1psidts(psid: str) -> str:
 	return ""
 
 
+def save_cached_1psidts(psid: str, psidts: str):
+	"""Persist the latest rotated 1PSIDTS for the current 1PSID."""
+	cached_file_path = get_cached_1psidts_path(psid)
+	if not cached_file_path or not psidts:
+		return
+
+	try:
+		os.makedirs(os.path.dirname(cached_file_path), exist_ok=True)
+		current_value = ""
+		if os.path.exists(cached_file_path):
+			current_value = Path(cached_file_path).read_text().strip()
+		if current_value == psidts:
+			return
+		Path(cached_file_path).write_text(psidts)
+		try:
+			os.chmod(cached_file_path, 0o600)
+		except Exception:
+			pass
+	except Exception as e:
+		logger.warning(f"Error writing cache file {cached_file_path}: {e}")
+
+
+def sync_cached_1psidts_from_client(client: Optional[GeminiClient], psid: str = ""):
+	"""Save the runtime 1PSIDTS from the live Gemini client into the legacy cache file."""
+	if client is None:
+		return
+	runtime_psid = get_cookie_value(getattr(client, "cookies", None), "__Secure-1PSID") or psid or SECURE_1PSID
+	runtime_psidts = get_cookie_value(getattr(client, "cookies", None), "__Secure-1PSIDTS")
+	if runtime_psid and runtime_psidts:
+		save_cached_1psidts(runtime_psid, runtime_psidts)
+
+
 def get_cookie_value(cookies, name: str) -> str:
 	"""Safely read a cookie value from an httpx cookie jar or mapping."""
 	if not cookies:
@@ -123,7 +155,7 @@ SECURE_1PSIDTS = os.environ.get("SECURE_1PSIDTS", "")
 API_KEY = os.environ.get("API_KEY", "")
 ENABLE_THINKING = os.environ.get("ENABLE_THINKING", "false").lower() == "true"
 TEMPORARY_CHAT = os.environ.get("TEMPORARY_CHAT", "false").lower() == "true"
-AUTO_DELETE_CHAT = os.environ.get("AUTO_DELETE_CHAT", "true").lower() == "true" and not TEMPORARY_CHAT
+AUTO_DELETE_CHAT = os.environ.get("AUTO_DELETE_CHAT", "false").lower() == "true" and not TEMPORARY_CHAT
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 SECRET_FILE_PATH = os.path.join(os.path.dirname(__file__), "secrets", "proxy_secret")
 GEMINI_COOKIE_PATH = os.path.join(os.path.dirname(__file__), "secrets")
@@ -791,8 +823,8 @@ async def get_gemini_client():
 					logger.info("Initializing Gemini client using %s credentials", source)
 
 					tmp_client = GeminiClient(psid, psidts)
-					await tmp_client.init(timeout=300)
-					await validate_gemini_client_session(tmp_client, source)
+					await tmp_client.init(timeout=300, auto_refresh=True, refresh_interval=600)
+					sync_cached_1psidts_from_client(tmp_client, psid)
 
 					gemini_client = tmp_client
 					break
@@ -1034,18 +1066,16 @@ async def create_chat_completion(
 					if thinking_started and not thinking_ended:
 						yield make_chunk({"content": "\n</think>\n\n"})
 
-					yield make_chunk({}, finish_reason="stop")
-					yield "data: [DONE]\n\n"
+						yield make_chunk({}, finish_reason="stop")
+						yield "data: [DONE]\n\n"
 
-					logger.info(
-						"Streaming response completed: chunks=%s images=%s videos=%s media=%s",
-						chunk_count,
-						yielded_images,
-						yielded_videos,
-						yielded_media,
-					)
-					if last_metadata and len(last_metadata) > 0 and not AUTO_DELETE_CHAT:
-						asyncio.create_task(background_verify_chat_persistence(gemini_client, last_metadata[0], "stream"))
+						logger.info(
+							"Streaming response completed: chunks=%s images=%s videos=%s media=%s",
+							chunk_count,
+							yielded_images,
+							yielded_videos,
+							yielded_media,
+						)
 				except Exception as e:
 					logger.error(f"Error during streaming: {str(e)}", exc_info=True)
 					error_msg = "\n\n[An internal error occurred while streaming]"
@@ -1053,6 +1083,7 @@ async def create_chat_completion(
 					yield make_chunk({}, finish_reason="stop")
 					yield "data: [DONE]\n\n"
 				finally:
+					sync_cached_1psidts_from_client(gemini_client)
 					if AUTO_DELETE_CHAT and captured_cid:
 						asyncio.create_task(background_delete_chat(gemini_client, captured_cid))
 					for temp_file in temp_files:
@@ -1068,11 +1099,10 @@ async def create_chat_completion(
 			if AUTO_DELETE_CHAT and hasattr(response, "metadata") and response.metadata and len(response.metadata) > 0:
 				cid = response.metadata[0]
 				asyncio.create_task(background_delete_chat(gemini_client, cid))
-			elif hasattr(response, "metadata") and response.metadata and len(response.metadata) > 0:
-				asyncio.create_task(background_verify_chat_persistence(gemini_client, response.metadata[0], "non-stream"))
 			elif not getattr(response, "metadata", None):
 				logger.warning("Non-stream response returned no Gemini metadata. This request may not map to a persistent Gemini chat.")
 		finally:
+			sync_cached_1psidts_from_client(gemini_client)
 			for temp_file in temp_files:
 				try:
 					os.unlink(temp_file)
