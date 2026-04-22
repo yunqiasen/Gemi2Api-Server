@@ -25,6 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from gemini_webapi import GeminiClient, set_log_level
 from gemini_webapi.constants import Model
+from gemini_webapi.exceptions import AuthError, TemporarilyBlocked, UsageLimitExceeded
 from PIL import Image
 from pydantic import BaseModel
 
@@ -63,6 +64,18 @@ def get_gemini_webapi_version() -> str:
 		return importlib.metadata.version("gemini-webapi")
 	except importlib.metadata.PackageNotFoundError:
 		return "unknown"
+
+
+def get_env_int(name: str, default: int, minimum: int = 0) -> int:
+	"""Parse an integer environment variable with a lower bound."""
+	raw = os.environ.get(name, "").strip()
+	if not raw:
+		return default
+	try:
+		return max(minimum, int(raw))
+	except ValueError:
+		logger.warning("Invalid integer for %s=%r, fallback=%s", name, raw, default)
+		return default
 
 
 def get_cached_1psidts_path(psid: str) -> str:
@@ -156,6 +169,8 @@ API_KEY = os.environ.get("API_KEY", "")
 ENABLE_THINKING = os.environ.get("ENABLE_THINKING", "false").lower() == "true"
 TEMPORARY_CHAT = os.environ.get("TEMPORARY_CHAT", "false").lower() == "true"
 AUTO_DELETE_CHAT = os.environ.get("AUTO_DELETE_CHAT", "false").lower() == "true" and not TEMPORARY_CHAT
+GEMINI_MAX_CONCURRENT = get_env_int("GEMINI_MAX_CONCURRENT", 1, minimum=1)
+GEMINI_COOLDOWN_SECONDS = get_env_int("GEMINI_COOLDOWN_SECONDS", 90, minimum=0)
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 SECRET_FILE_PATH = os.path.join(os.path.dirname(__file__), "secrets", "proxy_secret")
 GEMINI_COOKIE_PATH = os.path.join(os.path.dirname(__file__), "secrets")
@@ -170,6 +185,10 @@ AUTH_FAILURE_TEXT_PATTERNS = (
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 Edg/144.0.0.0"
 
 os.environ.setdefault("GEMINI_COOKIE_PATH", GEMINI_COOKIE_PATH)
+
+gemini_generation_semaphore = None
+gemini_cooldown_until = 0.0
+gemini_cooldown_reason = ""
 
 
 async def background_delete_chat(client: GeminiClient, cid: str):
@@ -188,6 +207,85 @@ def response_indicates_auth_failure(text: str) -> bool:
 	if not normalized:
 		return True
 	return any(pattern in normalized for pattern in AUTH_FAILURE_TEXT_PATTERNS)
+
+
+def get_gemini_generation_semaphore() -> asyncio.Semaphore:
+	"""Return the shared semaphore that serializes Gemini generation requests."""
+	global gemini_generation_semaphore
+	if gemini_generation_semaphore is None:
+		gemini_generation_semaphore = asyncio.Semaphore(GEMINI_MAX_CONCURRENT)
+	return gemini_generation_semaphore
+
+
+async def acquire_gemini_generation_slot(label: str) -> float:
+	"""Acquire a shared Gemini slot and return the queue wait time in seconds."""
+	start = time.monotonic()
+	await get_gemini_generation_semaphore().acquire()
+	waited = time.monotonic() - start
+	if waited >= 0.2:
+		logger.info("Gemini request queued: label=%s wait=%.2fs concurrency=%s", label, waited, GEMINI_MAX_CONCURRENT)
+	return waited
+
+
+def release_gemini_generation_slot():
+	"""Release the shared Gemini generation slot."""
+	get_gemini_generation_semaphore().release()
+
+
+def should_enter_gemini_cooldown(exc: Exception) -> bool:
+	"""Return True for upstream failures that should trigger a local cooldown."""
+	if isinstance(exc, (AuthError, TemporarilyBlocked, UsageLimitExceeded)):
+		return True
+
+	normalized = str(exc).strip().lower()
+	if not normalized:
+		return False
+
+	markers = (
+		"429",
+		"too many requests",
+		"temporarily blocked",
+		"usage limit",
+		"rate limit",
+		"quota",
+		"resource exhausted",
+		"authentication failed",
+	)
+	return any(marker in normalized for marker in markers)
+
+
+def activate_gemini_cooldown(reason: str, seconds: Optional[int] = None):
+	"""Start a local cooldown window to avoid hammering the same session/IP repeatedly."""
+	global gemini_cooldown_until, gemini_cooldown_reason
+	cooldown_seconds = GEMINI_COOLDOWN_SECONDS if seconds is None else max(0, seconds)
+	if cooldown_seconds <= 0:
+		return
+
+	until = time.time() + cooldown_seconds
+	if until > gemini_cooldown_until:
+		gemini_cooldown_until = until
+		gemini_cooldown_reason = (reason or "upstream protection").strip()[:200]
+		logger.warning("Gemini cooldown armed for %ss: %s", cooldown_seconds, gemini_cooldown_reason)
+
+
+def raise_if_gemini_cooldown():
+	"""Reject new upstream requests while the local cooldown is active."""
+	global gemini_cooldown_until, gemini_cooldown_reason
+	remaining = int(gemini_cooldown_until - time.time())
+	if remaining <= 0:
+		gemini_cooldown_until = 0.0
+		gemini_cooldown_reason = ""
+		return
+
+	detail = "Gemini session cooling down locally to reduce upstream risk"
+	if gemini_cooldown_reason:
+		detail += f": {gemini_cooldown_reason}"
+
+	raise HTTPException(
+		status_code=429,
+		detail=detail,
+		headers={"Retry-After": str(remaining)},
+	)
 
 
 async def fetch_readable_chat_response(client: GeminiClient, cid: str, retry_delays: List[int]) -> Optional[object]:
@@ -383,10 +481,12 @@ if not SECURE_1PSID or not SECURE_1PSIDTS:
 	logger.warning("Gemini credentials are missing; set SECURE_1PSID and SECURE_1PSIDTS before serving requests.")
 else:
 	logger.info(
-		"Startup config: thinking=%s temporary_chat=%s auto_delete_chat=%s public_base_url=%s gemini_webapi=%s",
+		"Startup config: thinking=%s temporary_chat=%s auto_delete_chat=%s max_concurrent=%s cooldown_seconds=%s public_base_url=%s gemini_webapi=%s",
 		ENABLE_THINKING,
 		TEMPORARY_CHAT,
 		AUTO_DELETE_CHAT,
+		GEMINI_MAX_CONCURRENT,
+		GEMINI_COOLDOWN_SECONDS,
 		bool(PUBLIC_BASE_URL),
 		get_gemini_webapi_version(),
 	)
@@ -792,6 +892,7 @@ async def get_gemini_client():
 			return gemini_client
 
 		try:
+			raise_if_gemini_cooldown()
 			psid = SECURE_1PSID
 			cached_psidts = load_cached_1psidts(psid)
 			attempts = []
@@ -840,7 +941,11 @@ async def get_gemini_client():
 			if gemini_client is None:
 				raise last_error
 
+		except HTTPException:
+			raise
 		except Exception as e:
+			if not isinstance(e, HTTPException) and should_enter_gemini_cooldown(e):
+				activate_gemini_cooldown(f"client init failed: {e}")
 			logger.error(f"Failed to initialize Gemini client: {str(e)}")
 			raise HTTPException(status_code=500, detail=f"Failed to initialize Gemini client: {str(e)}")
 	return gemini_client
@@ -927,6 +1032,7 @@ async def create_chat_completion(
 	and background conversation cleanup based on configuration.
 	"""
 	try:
+		raise_if_gemini_cooldown()
 		global gemini_client
 		gemini_client = await get_gemini_client()
 		runtime_models = get_runtime_available_models(gemini_client)
@@ -958,6 +1064,7 @@ async def create_chat_completion(
 		if request.stream:
 			async def generate_stream():
 				captured_cid = None
+				slot_acquired = False
 				try:
 					def make_chunk(delta: dict, finish_reason=None):
 						return (
@@ -981,6 +1088,11 @@ async def create_chat_completion(
 						)
 
 					yield make_chunk({"role": "assistant"})
+					raise_if_gemini_cooldown()
+					waited = await acquire_gemini_generation_slot("stream")
+					slot_acquired = True
+					if waited >= 0.2:
+						logger.info("Streaming request waited %.2fs before entering Gemini lane", waited)
 
 					thinking_started = False
 					thinking_ended = False
@@ -1066,23 +1178,29 @@ async def create_chat_completion(
 					if thinking_started and not thinking_ended:
 						yield make_chunk({"content": "\n</think>\n\n"})
 
-						yield make_chunk({}, finish_reason="stop")
-						yield "data: [DONE]\n\n"
+					yield make_chunk({}, finish_reason="stop")
+					yield "data: [DONE]\n\n"
 
-						logger.info(
-							"Streaming response completed: chunks=%s images=%s videos=%s media=%s",
-							chunk_count,
-							yielded_images,
-							yielded_videos,
-							yielded_media,
-						)
+					logger.info(
+						"Streaming response completed: chunks=%s images=%s videos=%s media=%s",
+						chunk_count,
+						yielded_images,
+						yielded_videos,
+						yielded_media,
+					)
+				except HTTPException:
+					raise
 				except Exception as e:
+					if should_enter_gemini_cooldown(e):
+						activate_gemini_cooldown(f"stream failed: {e}")
 					logger.error(f"Error during streaming: {str(e)}", exc_info=True)
 					error_msg = "\n\n[An internal error occurred while streaming]"
 					yield make_chunk({"content": error_msg})
 					yield make_chunk({}, finish_reason="stop")
 					yield "data: [DONE]\n\n"
 				finally:
+					if slot_acquired:
+						release_gemini_generation_slot()
 					sync_cached_1psidts_from_client(gemini_client)
 					if AUTO_DELETE_CHAT and captured_cid:
 						asyncio.create_task(background_delete_chat(gemini_client, captured_cid))
@@ -1094,7 +1212,12 @@ async def create_chat_completion(
 
 			return StreamingResponse(generate_stream(), media_type="text/event-stream")
 
+		slot_acquired = False
 		try:
+			waited = await acquire_gemini_generation_slot("non-stream")
+			slot_acquired = True
+			if waited >= 0.2:
+				logger.info("Non-stream request waited %.2fs before entering Gemini lane", waited)
 			response = await gemini_client.generate_content(conversation, **gen_kwargs)
 			if AUTO_DELETE_CHAT and hasattr(response, "metadata") and response.metadata and len(response.metadata) > 0:
 				cid = response.metadata[0]
@@ -1102,6 +1225,8 @@ async def create_chat_completion(
 			elif not getattr(response, "metadata", None):
 				logger.warning("Non-stream response returned no Gemini metadata. This request may not map to a persistent Gemini chat.")
 		finally:
+			if slot_acquired:
+				release_gemini_generation_slot()
 			sync_cached_1psidts_from_client(gemini_client)
 			for temp_file in temp_files:
 				try:
@@ -1146,7 +1271,11 @@ async def create_chat_completion(
 		logger.info("Non-streaming response completed")
 		return result
 
+	except HTTPException:
+		raise
 	except Exception as e:
+		if should_enter_gemini_cooldown(e):
+			activate_gemini_cooldown(f"request failed: {e}")
 		logger.error(f"Error generating completion: {str(e)}", exc_info=True)
 		raise HTTPException(status_code=500, detail=f"Error generating completion: {str(e)}")
 

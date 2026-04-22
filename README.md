@@ -22,6 +22,8 @@ SECURE_1PSIDTS = "COOKIE VALUE HERE"
 API_KEY= "API_KEY VALUE HERE"
 TEMPORARY_CHAT = "false" # 使用临时对话模式，此模式会禁用部分功能如思考、图片生成等，默认关闭。
 AUTO_DELETE_CHAT = "false" # 低噪音模式建议关闭，避免每次请求额外发 delete 请求。TEMPORARY_CHAT为true时，此项无效。
+GEMINI_MAX_CONCURRENT = "1" # 单账号建议保持 1，避免同一 IP / 同一会话并发过高触发风控。
+GEMINI_COOLDOWN_SECONDS = "90" # 命中 429 / 限流 / 封控类错误后，本地冷却时间，避免继续猛打上游。
 PUBLIC_BASE_URL = "https://your-domain.com" # 外部URL，用于生成图片代理链接，不填则会使用内部地址。使用反向代理时必填，否则可能导致图片无法访问。
 ```
 1. `uv` 安装一下依赖
