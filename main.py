@@ -25,6 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from gemini_webapi import GeminiClient, set_log_level
 from gemini_webapi.constants import Model
+from gemini_webapi.exceptions import AuthError
 from PIL import Image
 from pydantic import BaseModel
 
@@ -40,7 +41,10 @@ gemini_client_lock = asyncio.Lock()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 	"""Initialize the Gemini client during startup and close it on shutdown."""
-	await get_gemini_client()
+	if GEMINI_STARTUP_EAGER_INIT:
+		await get_gemini_client()
+	else:
+		logger.info("Startup eager Gemini init is disabled; client will initialize lazily on first request.")
 	try:
 		yield
 	finally:
@@ -65,20 +69,98 @@ def get_gemini_webapi_version() -> str:
 		return "unknown"
 
 
+def get_env_bool(name: str, default: bool) -> bool:
+	"""Parse a boolean environment variable with sane defaults."""
+	value = os.environ.get(name)
+	if value is None:
+		return default
+	return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_env_int(name: str, default: int, minimum: Optional[int] = None) -> int:
+	"""Parse an integer environment variable with fallback and optional lower bound."""
+	raw = os.environ.get(name, "").strip()
+	if not raw:
+		return default
+	try:
+		value = int(raw)
+	except ValueError:
+		logger.warning("Invalid integer for %s=%r, using default=%s", name, raw, default)
+		return default
+	if minimum is not None and value < minimum:
+		return minimum
+	return value
+
+
 def get_cached_1psidts_path(psid: str) -> str:
-	"""Return the cache path for a rotated 1PSIDTS value."""
+	"""Return the legacy cache path for a rotated 1PSIDTS value."""
 	if not psid or not re.match("^[\\w\\-\\.]+$", psid):
 		return ""
 	return os.path.join(GEMINI_COOKIE_PATH, f".cached_1psidts_{psid}.txt")
 
 
-def load_cached_1psidts(psid: str) -> str:
-	"""Load a cached rotated 1PSIDTS value for the given 1PSID."""
-	cached_file_path = get_cached_1psidts_path(psid)
-	if not cached_file_path:
+def get_cached_cookies_json_path(psid: str) -> str:
+	"""Return the gemini-webapi v2 cookie cache path for the given 1PSID."""
+	if not psid or not re.match("^[\\w\\-\\.]+$", psid):
+		return ""
+	return os.path.join(GEMINI_COOKIE_PATH, f".cached_cookies_{psid}.json")
+
+
+def get_latest_cached_cookies_json_path() -> str:
+	"""Return the most recently updated gemini-webapi cookie cache file, if any."""
+	try:
+		cache_files = sorted(
+			Path(GEMINI_COOKIE_PATH).glob(".cached_cookies_*.json"),
+			key=lambda path: path.stat().st_mtime,
+			reverse=True,
+		)
+		return str(cache_files[0]) if cache_files else ""
+	except Exception as e:
+		logger.warning(f"Error inspecting cookie cache directory {GEMINI_COOKIE_PATH}: {e}")
 		return ""
 
-	if os.path.exists(cached_file_path):
+
+def load_cached_cookie_snapshot(psid: str = "") -> Dict[str, str]:
+	"""Load auth cookies from gemini-webapi's persisted cookie cache."""
+	candidate_paths = []
+	direct_path = get_cached_cookies_json_path(psid)
+	if direct_path:
+		candidate_paths.append(direct_path)
+	elif not psid:
+		latest_path = get_latest_cached_cookies_json_path()
+		if latest_path and latest_path not in candidate_paths:
+			candidate_paths.append(latest_path)
+
+	for cache_file_path in candidate_paths:
+		if not cache_file_path or not os.path.exists(cache_file_path):
+			continue
+		try:
+			content = Path(cache_file_path).read_text().strip()
+			if not content:
+				continue
+			cookies = json.loads(content)
+			if not isinstance(cookies, list):
+				continue
+			result: Dict[str, str] = {}
+			for cookie in cookies:
+				if not isinstance(cookie, dict):
+					continue
+				name = str(cookie.get("name", "") or "")
+				value = str(cookie.get("value", "") or "")
+				if name and value:
+					result[name] = value
+			if result:
+				return result
+		except Exception as e:
+			logger.warning(f"Error reading cookie cache file {cache_file_path}: {e}")
+
+	return {}
+
+
+def load_cached_1psidts(psid: str) -> str:
+	"""Load a cached rotated 1PSIDTS value from legacy or gemini-webapi v2 caches."""
+	cached_file_path = get_cached_1psidts_path(psid)
+	if cached_file_path and os.path.exists(cached_file_path):
 		try:
 			content = Path(cached_file_path).read_text().strip()
 			if content:
@@ -86,7 +168,8 @@ def load_cached_1psidts(psid: str) -> str:
 		except Exception as e:
 			logger.warning(f"Error reading cache file {cached_file_path}: {e}")
 
-	return ""
+	cached_snapshot = load_cached_cookie_snapshot(psid)
+	return cached_snapshot.get("__Secure-1PSIDTS", "")
 
 
 def get_cookie_value(cookies, name: str) -> str:
@@ -121,9 +204,15 @@ app.add_middleware(
 SECURE_1PSID = os.environ.get("SECURE_1PSID", "")
 SECURE_1PSIDTS = os.environ.get("SECURE_1PSIDTS", "")
 API_KEY = os.environ.get("API_KEY", "")
-ENABLE_THINKING = os.environ.get("ENABLE_THINKING", "false").lower() == "true"
-TEMPORARY_CHAT = os.environ.get("TEMPORARY_CHAT", "false").lower() == "true"
-AUTO_DELETE_CHAT = os.environ.get("AUTO_DELETE_CHAT", "true").lower() == "true" and not TEMPORARY_CHAT
+ENABLE_THINKING = get_env_bool("ENABLE_THINKING", False)
+TEMPORARY_CHAT = get_env_bool("TEMPORARY_CHAT", False)
+AUTO_DELETE_CHAT = get_env_bool("AUTO_DELETE_CHAT", True) and not TEMPORARY_CHAT
+VERIFY_CHAT_PERSISTENCE = get_env_bool("VERIFY_CHAT_PERSISTENCE", True)
+ALLOW_BROWSER_COOKIE_FALLBACK = get_env_bool("ALLOW_BROWSER_COOKIE_FALLBACK", True)
+GEMINI_AUTO_REFRESH = get_env_bool("GEMINI_AUTO_REFRESH", True)
+GEMINI_STARTUP_EAGER_INIT = get_env_bool("GEMINI_STARTUP_EAGER_INIT", True)
+GEMINI_STRICT_SESSION_VALIDATION = get_env_bool("GEMINI_STRICT_SESSION_VALIDATION", True)
+GEMINI_REFRESH_INTERVAL = get_env_int("GEMINI_REFRESH_INTERVAL", 600, minimum=60)
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 SECRET_FILE_PATH = os.path.join(os.path.dirname(__file__), "secrets", "proxy_secret")
 GEMINI_COOKIE_PATH = os.path.join(os.path.dirname(__file__), "secrets")
@@ -232,6 +321,74 @@ async def validate_gemini_client_session(client: GeminiClient, source: str):
 				await client.delete_chat(validation_cid)
 			except Exception:
 				logger.debug("Failed to delete Gemini validation chat %s", validation_cid)
+
+
+def build_gemini_init_attempts() -> List[Dict[str, str]]:
+	"""Build low-risk credential initialization attempts in priority order."""
+	env_psid = SECURE_1PSID.strip()
+	env_psidts = SECURE_1PSIDTS.strip()
+	cached_snapshot = load_cached_cookie_snapshot(env_psid)
+	cached_psid = cached_snapshot.get("__Secure-1PSID", "")
+	cached_psidts = cached_snapshot.get("__Secure-1PSIDTS", "") or load_cached_1psidts(env_psid or cached_psid)
+
+	attempts: List[Dict[str, str]] = []
+	seen = set()
+
+	def add_attempt(source: str, psid: str = "", psidts: str = ""):
+		key = (psid or "", psidts or "", source)
+		if key in seen:
+			return
+		seen.add(key)
+		attempts.append({"source": source, "psid": psid or "", "psidts": psidts or ""})
+
+	if env_psid and cached_psidts:
+		add_attempt("env_psid+cached_1psidts", env_psid, cached_psidts)
+	if env_psid:
+		add_attempt("environment", env_psid, env_psidts)
+	if cached_psid:
+		add_attempt("cached_cookies", cached_psid, cached_psidts)
+	if ALLOW_BROWSER_COOKIE_FALLBACK or not attempts:
+		add_attempt("browser_auto")
+
+	return attempts
+
+
+def should_reset_client_after_error(exc: Exception) -> bool:
+	"""Return True for auth/session errors that should force client re-init next time."""
+	if isinstance(exc, AuthError):
+		return True
+	normalized = str(exc).strip().lower()
+	if not normalized:
+		return False
+	auth_markers = (
+		"signed-out",
+		"sign in",
+		"signed in",
+		"failed to initialize client after",
+		"validation probe returned signed-out",
+		"validation probe chat was not readable",
+		"__secure-1psidts",
+		"authentication failed",
+	)
+	return any(marker in normalized for marker in auth_markers)
+
+
+async def discard_gemini_client(reason: str):
+	"""Close and drop the shared Gemini client so the next request re-initializes it."""
+	global gemini_client
+	async with gemini_client_lock:
+		client = gemini_client
+		gemini_client = None
+
+	if client is None:
+		return
+
+	try:
+		await client.close()
+	except Exception as e:
+		logger.warning("Failed to close Gemini client while resetting after %s: %s", reason, e)
+	finally:
+		logger.warning("Discarded Gemini client after %s", reason)
 
 
 def load_or_generate_secret() -> str:
@@ -347,21 +504,30 @@ def remove_gemini_watermark(image_bytes: bytes) -> bytes:
 		return image_bytes
 
 
-if not SECURE_1PSID or not SECURE_1PSIDTS:
-	logger.warning("Gemini credentials are missing; set SECURE_1PSID and SECURE_1PSIDTS before serving requests.")
-else:
-	logger.info(
-		"Startup config: thinking=%s temporary_chat=%s auto_delete_chat=%s public_base_url=%s gemini_webapi=%s",
-		ENABLE_THINKING,
-		TEMPORARY_CHAT,
-		AUTO_DELETE_CHAT,
-		bool(PUBLIC_BASE_URL),
-		get_gemini_webapi_version(),
+if not SECURE_1PSID:
+	logger.info("SECURE_1PSID is not set; server will try cache/browser-cookie3 fallback if available.")
+elif not re.match("^[\\w\\-\\.]+$", SECURE_1PSID):
+	logger.warning(
+		"SECURE_1PSID contains characters outside the safe cache filename pattern. This may be valid for auth, but psid-based cache lookup will fall back to runtime/browser data."
 	)
-	if not re.match("^[\\w\\-\\.]+$", SECURE_1PSID):
-		logger.warning(
-			"SECURE_1PSID contains characters outside the safe cache filename pattern. This may be valid for auth, but cached 1PSIDTS lookup will fall back to the env value."
-		)
+
+if not SECURE_1PSIDTS:
+	logger.info("SECURE_1PSIDTS is not set; server will rely on rotated/cache/browser cookies when possible.")
+
+logger.info(
+	"Startup config: thinking=%s temporary_chat=%s auto_delete_chat=%s verify_chat_persistence=%s auto_refresh=%s refresh_interval=%s strict_validation=%s eager_init=%s browser_fallback=%s public_base_url=%s gemini_webapi=%s",
+	ENABLE_THINKING,
+	TEMPORARY_CHAT,
+	AUTO_DELETE_CHAT,
+	VERIFY_CHAT_PERSISTENCE,
+	GEMINI_AUTO_REFRESH,
+	GEMINI_REFRESH_INTERVAL,
+	GEMINI_STRICT_SESSION_VALIDATION,
+	GEMINI_STARTUP_EAGER_INIT,
+	ALLOW_BROWSER_COOKIE_FALLBACK,
+	bool(PUBLIC_BASE_URL),
+	get_gemini_webapi_version(),
+)
 
 if not API_KEY:
 	logger.info("API key authentication is disabled.")
@@ -760,39 +926,29 @@ async def get_gemini_client():
 			return gemini_client
 
 		try:
-			psid = SECURE_1PSID
-			cached_psidts = load_cached_1psidts(psid)
-			attempts = []
-
-			if cached_psidts:
-				attempts.append(("cache", cached_psidts))
-			if SECURE_1PSIDTS:
-				attempts.append(("environment", SECURE_1PSIDTS))
-
-			seen_psidts = set()
-			new_attempts = []
-			for source, psidts in attempts:
-				if not psidts or psidts in seen_psidts:
-					continue
-				seen_psidts.add(psidts)
-				new_attempts.append((source, psidts))
-			attempts = new_attempts
-
+			attempts = build_gemini_init_attempts()
 			if not attempts:
-				raise HTTPException(
-					status_code=500,
-					detail="Missing SECURE_1PSIDTS and no cached rotated 1PSIDTS is available",
-				)
+				raise HTTPException(status_code=500, detail="No Gemini credential sources are available")
 
 			last_error = None
-			for source, psidts in attempts:
+			for attempt in attempts:
 				tmp_client = None
 				try:
+					source = attempt["source"]
+					psid = attempt["psid"]
+					psidts = attempt["psidts"]
 					logger.info("Initializing Gemini client using %s credentials", source)
 
-					tmp_client = GeminiClient(psid, psidts)
-					await tmp_client.init(timeout=300)
-					await validate_gemini_client_session(tmp_client, source)
+					tmp_client = GeminiClient(psid or None, psidts or None) if psid else GeminiClient()
+					await tmp_client.init(
+						timeout=300,
+						auto_refresh=GEMINI_AUTO_REFRESH,
+						refresh_interval=GEMINI_REFRESH_INTERVAL,
+					)
+					if GEMINI_STRICT_SESSION_VALIDATION:
+						await validate_gemini_client_session(tmp_client, source)
+					else:
+						logger.info("Skipping strict Gemini session validation for source=%s", source)
 
 					gemini_client = tmp_client
 					break
@@ -1029,24 +1185,26 @@ async def create_chat_completion(
 									yield make_chunk({"content": f"\n\n[🎵 Media Audio {idx}]({proxy_url})\n\n"})
 							yielded_media = len(chunk.media)
 
-					if text_buffer:
-						yield make_chunk({"content": postprocess_text(text_buffer)})
-					if thinking_started and not thinking_ended:
-						yield make_chunk({"content": "\n</think>\n\n"})
+						if text_buffer:
+							yield make_chunk({"content": postprocess_text(text_buffer)})
+						if thinking_started and not thinking_ended:
+							yield make_chunk({"content": "\n</think>\n\n"})
 
-					yield make_chunk({}, finish_reason="stop")
-					yield "data: [DONE]\n\n"
+						yield make_chunk({}, finish_reason="stop")
+						yield "data: [DONE]\n\n"
 
-					logger.info(
-						"Streaming response completed: chunks=%s images=%s videos=%s media=%s",
-						chunk_count,
-						yielded_images,
-						yielded_videos,
-						yielded_media,
-					)
-					if last_metadata and len(last_metadata) > 0 and not AUTO_DELETE_CHAT:
-						asyncio.create_task(background_verify_chat_persistence(gemini_client, last_metadata[0], "stream"))
+						logger.info(
+							"Streaming response completed: chunks=%s images=%s videos=%s media=%s",
+							chunk_count,
+							yielded_images,
+							yielded_videos,
+							yielded_media,
+						)
+						if last_metadata and len(last_metadata) > 0 and not AUTO_DELETE_CHAT and VERIFY_CHAT_PERSISTENCE:
+							asyncio.create_task(background_verify_chat_persistence(gemini_client, last_metadata[0], "stream"))
 				except Exception as e:
+					if should_reset_client_after_error(e):
+						await discard_gemini_client(f"streaming failure: {e}")
 					logger.error(f"Error during streaming: {str(e)}", exc_info=True)
 					error_msg = "\n\n[An internal error occurred while streaming]"
 					yield make_chunk({"content": error_msg})
@@ -1068,7 +1226,7 @@ async def create_chat_completion(
 			if AUTO_DELETE_CHAT and hasattr(response, "metadata") and response.metadata and len(response.metadata) > 0:
 				cid = response.metadata[0]
 				asyncio.create_task(background_delete_chat(gemini_client, cid))
-			elif hasattr(response, "metadata") and response.metadata and len(response.metadata) > 0:
+			elif hasattr(response, "metadata") and response.metadata and len(response.metadata) > 0 and VERIFY_CHAT_PERSISTENCE:
 				asyncio.create_task(background_verify_chat_persistence(gemini_client, response.metadata[0], "non-stream"))
 			elif not getattr(response, "metadata", None):
 				logger.warning("Non-stream response returned no Gemini metadata. This request may not map to a persistent Gemini chat.")
@@ -1117,6 +1275,8 @@ async def create_chat_completion(
 		return result
 
 	except Exception as e:
+		if should_reset_client_after_error(e):
+			await discard_gemini_client(f"request failure: {e}")
 		logger.error(f"Error generating completion: {str(e)}", exc_info=True)
 		raise HTTPException(status_code=500, detail=f"Error generating completion: {str(e)}")
 
@@ -1157,8 +1317,14 @@ def validate_proxy_target(url: str):
 
 def build_proxy_cookie_jar() -> httpx.Cookies:
 	jar = httpx.Cookies()
-	psid = SECURE_1PSID
-	psidts = get_cookie_value(getattr(gemini_client, "cookies", None), "__Secure-1PSIDTS") or load_cached_1psidts(psid) or SECURE_1PSIDTS
+	runtime_cookies = getattr(gemini_client, "cookies", None)
+	runtime_psidts = get_cookie_value(runtime_cookies, "__Secure-1PSIDTS")
+	psid = get_cookie_value(runtime_cookies, "__Secure-1PSID") or SECURE_1PSID
+	cached_snapshot = load_cached_cookie_snapshot(psid)
+	psid = psid or cached_snapshot.get("__Secure-1PSID", "")
+	psidts = runtime_psidts or load_cached_1psidts(psid) or cached_snapshot.get("__Secure-1PSIDTS", "") or SECURE_1PSIDTS
+	if not psid or not psidts:
+		raise HTTPException(status_code=503, detail="Gemini proxy cookies are unavailable; reinitialize credentials first")
 	jar.set("__Secure-1PSID", psid, domain=".google.com")
 	jar.set("__Secure-1PSIDTS", psidts, domain=".google.com")
 	jar.set("__Secure-1PSID", psid, domain=".googleusercontent.com")
@@ -1235,6 +1401,8 @@ async def proxy_google_asset(
 					},
 				)
 		except httpx.HTTPStatusError as e:
+			if e.response.status_code in {401, 403}:
+				await discard_gemini_client(f"proxy auth failure {e.response.status_code}")
 			logger.error(f"Failed to fetch asset: {e.response.status_code} for {url}")
 			raise HTTPException(
 				status_code=e.response.status_code,
@@ -1312,6 +1480,8 @@ async def stream_google_media_asset(
 
 		return StreamingResponse(iter_bytes(), media_type=media_type, headers=response_headers)
 	except httpx.HTTPStatusError as e:
+		if e.response.status_code in {401, 403}:
+			await discard_gemini_client(f"media proxy auth failure {e.response.status_code}")
 		await client.aclose()
 		logger.error(f"Failed to fetch media asset: {e.response.status_code} for {url}")
 		raise HTTPException(

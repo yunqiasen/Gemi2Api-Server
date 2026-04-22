@@ -15,13 +15,19 @@
 
 ## 直接运行
 
-0. 填入 `SECURE_1PSID` 和 `SECURE_1PSIDTS`（登录 Gemini 在浏览器开发工具中查找 Cookie），有必要的话可以填写 `API_KEY`
+0. 填入 `SECURE_1PSID` 和 `SECURE_1PSIDTS`（登录 Gemini 在浏览器开发工具中查找 Cookie），有必要的话可以填写 `API_KEY`。如果本机装了 `browser-cookie3` 且浏览器已登录 Gemini，也可以只填 `SECURE_1PSID`，甚至不填 Cookie，交给本地浏览器 Cookie / 缓存兜底。
 ```properties
 SECURE_1PSID = "COOKIE VALUE HERE"
 SECURE_1PSIDTS = "COOKIE VALUE HERE"
 API_KEY= "API_KEY VALUE HERE"
 TEMPORARY_CHAT = "false" # 使用临时对话模式，此模式会禁用部分功能如思考、图片生成等，默认关闭。
 AUTO_DELETE_CHAT = "true" # 生成结束后自动从web端删除对话记录，默认开启。TEMPORARY_CHAT为true时，此项无效。
+VERIFY_CHAT_PERSISTENCE = "false" # 关闭额外的历史读取验证，减少额外请求，更适合低风控模式。
+ALLOW_BROWSER_COOKIE_FALLBACK = "true" # 允许从本机浏览器和 gemini-webapi cookie cache 自动兜底。
+GEMINI_AUTO_REFRESH = "true" # 开启后台自动刷新 __Secure-1PSIDTS。
+GEMINI_REFRESH_INTERVAL = "600" # Cookie 后台刷新间隔，最小 60 秒。
+GEMINI_STARTUP_EAGER_INIT = "false" # 启动时不主动打 Gemini，首次请求再懒加载。
+GEMINI_STRICT_SESSION_VALIDATION = "false" # 关闭启动阶段 generate_content + 读历史的严格验证，减少额外探测流量。
 PUBLIC_BASE_URL = "https://your-domain.com" # 外部URL，用于生成图片代理链接，不填则会使用内部地址。使用反向代理时必填，否则可能导致图片无法访问。
 ```
 1. `uv` 安装一下依赖
@@ -95,7 +101,7 @@ docker-compose up -d --build
 
 ### 服务器报 500 问题解决方案
 
-500 的问题一般是 IP 不太行 或者 请求太频繁（后者等待一段时间或者重新新建一个隐身标签登录一下重新给 Secure_1PSID 和 Secure_1PSIDTS 即可），见 issue：
+500 的问题一般是 IP 不太行 或者 请求太频繁。当前版本默认会把 `gemini-webapi` 自动刷新的 Cookie 缓存在 `secrets/.cached_cookies_*.json`，进程存活期间也会后台续 `__Secure-1PSIDTS`。但如果 Google 彻底废掉登录态，还是需要重新登录一次浏览器再让服务接管新的 Cookie。相关 issue：
 - [__Secure-1PSIDTS · Issue #6 · HanaokaYuzu/Gemini-API](https://github.com/HanaokaYuzu/Gemini-API/issues/6)
 - [Failed to initialize client. SECURE_1PSIDTS could get expired frequently · Issue #72 · HanaokaYuzu/Gemini-API](https://github.com/HanaokaYuzu/Gemini-API/issues/72)
 
