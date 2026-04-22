@@ -693,6 +693,7 @@ async def list_models():
 				"owned_by": "google-gemini-web",
 			}
 			for m in Model
+			if m is not Model.UNSPECIFIED
 		]
 	return {"object": "list", "data": data}
 

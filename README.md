@@ -94,6 +94,58 @@ docker-compose up -d --build
 - `GET /v1/models`: 获取可用模型列表
 - `POST /v1/chat/completions`: 与模型聊天 (类似OpenAI接口)
 - `GET /gemini-proxy/image`: 图片代理接口（有生成图片需求时，需要保证此端点可直接访问，如果使用反向代理则需要填写`PUBLIC_BASE_URL`环境变量）
+- `GET /gemini-proxy/media`: 视频/音频媒体代理接口
+
+## 模型暴露说明（按源码）
+
+### `/v1/models` 的暴露逻辑
+
+- 服务端优先返回 `GeminiClient.list_models()` 动态发现的**当前账号真实可用模型**
+- 如果动态获取失败，才回退到 `gemini_webapi.constants.Model` 里的静态枚举
+- 动态模型返回字段包含：
+  - `id`
+  - `display_name`
+  - `description`
+  - `advanced_only`
+
+### 静态回退模型（源码内置）
+
+如果当前账号的动态模型列表取不到，服务会回退为下面这 9 个静态模型：
+
+- `gemini-3-pro`
+- `gemini-3-flash`
+- `gemini-3-flash-thinking`
+- `gemini-3-pro-plus`
+- `gemini-3-flash-plus`
+- `gemini-3-flash-thinking-plus`
+- `gemini-3-pro-advanced`
+- `gemini-3-flash-advanced`
+- `gemini-3-flash-thinking-advanced`
+
+### 文本 / 生图 / 视频 / 音频模型怎么区分
+
+- **文本模型**：源码里静态枚举基本都是通用文本 / 推理模型，上面这 9 个都属于这一类
+- **生图 / 视频 / 音频模型**：当前服务**不在源码里写死具体模型名**
+- 服务端只做两件事：
+  1. `/v1/models` 把账号动态返回的模型原样暴露出来
+  2. `map_model_name()` 会根据模型名 / 显示名 / 描述里的关键词做匹配，关键词包括：
+     - `vision` / `image`
+     - `video` / `veo`
+     - `audio` / `music`
+
+也就是说：
+
+- 你的账号如果实际开放了**生图模型**，它会出现在 `/v1/models`
+- 你的账号如果实际开放了**视频模型**，它也会出现在 `/v1/models`
+- 项目本身支持把这些结果透出：
+  - 图片结果走 `/gemini-proxy/image`
+  - 视频 / 音频结果走 `/gemini-proxy/media`
+
+### 查看自己账号当前到底暴露了哪些模型
+
+```bash
+curl -s http://127.0.0.1:8000/v1/models | python3 -m json.tool
+```
 
 ## 常见问题
 
