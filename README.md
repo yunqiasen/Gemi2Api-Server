@@ -15,15 +15,22 @@
 
 ## 直接运行
 
-0. 填入 `SECURE_1PSID` 和 `SECURE_1PSIDTS`（登录 Gemini 在浏览器开发工具中查找 Cookie），有必要的话可以填写 `API_KEY`
+0. 填配置。现在支持三种 Cookie 方式，推荐顺序：
+   1. **`COOKIES_JSON_PATH`**：直接复用 `Gemini-API` 的 `cookies.json`
+   2. **`SECURE_1PSID` + `SECURE_1PSIDTS`**：手工填双 Cookie
+   3. **都不填**：让底层 `gemini-webapi` 走本机浏览器 Cookie / 本地缓存自动发现（前提是已安装 `browser-cookie3` 且浏览器已登录）
 ```properties
+COOKIES_JSON_PATH = "/absolute/path/to/cookies.json" # 推荐。兼容 Gemini-API CLI 的 cookies.json，多余 Cookie 会一并带上并在运行时回写刷新后的值。
 SECURE_1PSID = "COOKIE VALUE HERE"
 SECURE_1PSIDTS = "COOKIE VALUE HERE"
+GEMINI_SECURE_1PSID = "" # 可选。兼容 Gemini-API 的环境变量命名。
+GEMINI_SECURE_1PSIDTS = "" # 可选。兼容 Gemini-API 的环境变量命名。
 API_KEY= "sk-your-own-token" # 这是你给本服务设置的 Bearer Token，不是 Google 提供的 Key，可自定义。
 TEMPORARY_CHAT = "false" # 使用临时对话模式，此模式会禁用部分功能如思考、图片生成等，默认关闭。
 AUTO_DELETE_CHAT = "false" # 低噪音模式建议关闭，避免每次请求额外发 delete 请求。TEMPORARY_CHAT为true时，此项无效。
 GEMINI_MAX_CONCURRENT = "1" # 单账号建议保持 1，避免同一 IP / 同一会话并发过高触发风控。
 PUBLIC_BASE_URL = "" # 本地测试请留空；只有挂了反向代理/公网域名时才填写外部地址。
+GEMINI_SKIP_VERIFY = "false" # 可选。仅在你明确知道证书校验有问题时才打开。
 ```
 1. `uv` 安装一下依赖
 > uv init
@@ -46,6 +53,12 @@ PUBLIC_BASE_URL = "" # 本地测试请留空；只有挂了反向代理/公网�
 
 > [!NOTE]
 > 当前 `main.py` 是直接读取 `os.environ`，不会自动加载 `.env`。如果不用 `--env-file .env`，那就需要先手动 `source .env` 再启动。
+
+> [!NOTE]
+> 运行时会同步维护三类 Cookie 缓存：
+> - `secrets/.cached_1psidts_<psid>.txt`：兼容旧逻辑的 1PSIDTS 缓存
+> - `secrets/.cached_cookies_<psid>.json`：`gemini-webapi` 保存的完整 Google Cookie 缓存
+> - `COOKIES_JSON_PATH`：如果你配置了它，服务会把刷新后的 Cookie 回写到这个 JSON
 
 > [!WARNING] 
 > tips: 如果不填写 API_KEY ，那么就直接使用
@@ -287,18 +300,22 @@ python cli.py --cookies-json cookies.json inspect
 
 ### 服务器报 500 问题解决方案
 
-500 的问题一般是 IP 不太行 或者 请求太频繁（后者等待一段时间或者重新新建一个隐身标签登录一下重新给 Secure_1PSID 和 Secure_1PSIDTS 即可）。当前版本只维护你手工提供的这两个 Cookie：运行期间依赖 `gemini-webapi` 后台自动刷新 `__Secure-1PSIDTS`，并把最新值同步到 `secrets/.cached_1psidts_<psid>.txt`，重启后优先复用这个刷新结果。见 issue：
+500 的问题一般是 IP 不太行 或者 请求太频繁（后者等待一段时间或者重新新建一个隐身标签登录一下重新导出 Cookie 即可）。当前版本已经接入了 Gemini-API 的多来源 Cookie 逻辑：
+- 手工双 Cookie（`SECURE_1PSID` / `SECURE_1PSIDTS`）
+- `COOKIES_JSON_PATH`
+- `gemini-webapi` 的完整 Cookie 缓存
+- 浏览器自动读取（底层 `browser-cookie3`）
+
+运行期间依赖 `gemini-webapi` 后台自动刷新 `__Secure-1PSIDTS`，同时会把最新值同步到 `secrets/.cached_1psidts_<psid>.txt`、`secrets/.cached_cookies_<psid>.json`，如果你配置了 `COOKIES_JSON_PATH`，还会把刷新后的 Cookie 回写到该 JSON。见 issue：
 - [__Secure-1PSIDTS · Issue #6 · HanaokaYuzu/Gemini-API](https://github.com/HanaokaYuzu/Gemini-API/issues/6)
 - [Failed to initialize client. SECURE_1PSIDTS could get expired frequently · Issue #72 · HanaokaYuzu/Gemini-API](https://github.com/HanaokaYuzu/Gemini-API/issues/72)
 
-解决步骤：
+更推荐的解决步骤：
 1. 使用隐身标签访问 [Google Gemini](https://gemini.google.com/) 并登录
-2. 打开浏览器开发工具 (F12)
-3. 切换到 "Application" 或 "应用程序" 标签
-4. 在左侧找到 "Cookies" > "gemini.google.com"
-5. 复制 `__Secure-1PSID` 和 `__Secure-1PSIDTS` 的值
-6. 更新 `.env` 文件
-7. 重新构建并启动: `docker-compose up -d --build`
+2. 导出完整 `cookies.json`（或至少重新复制最新的 `__Secure-1PSID` / `__Secure-1PSIDTS`）
+3. 优先把 `.env` 改成 `COOKIES_JSON_PATH=/absolute/path/to/cookies.json`
+4. 如果仍异常，再清掉本项目 `secrets/.cached_1psidts_*` 与 `secrets/.cached_cookies_*`
+5. 重新启动服务：`docker-compose up -d --build`
 
 ## 致谢
 

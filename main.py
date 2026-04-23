@@ -14,6 +14,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import quote, urlparse
@@ -77,6 +78,264 @@ def get_env_int(name: str, default: int, minimum: int = 0) -> int:
 		return default
 
 
+def get_env_base_url(name: str) -> str:
+	"""Parse a public base URL and ignore common placeholder values."""
+	raw = os.environ.get(name, "").strip()
+	if not raw:
+		return ""
+
+	placeholder_values = {
+		"your_external_base_url_here",
+		"http://your_external_base_url_here",
+		"https://your_external_base_url_here",
+	}
+	if raw.lower() in placeholder_values:
+		logger.warning("Ignoring placeholder %s=%r; media proxy URLs will use the incoming request host instead.", name, raw)
+		return ""
+
+	return raw.rstrip("/")
+
+
+def get_env_bool(name: str, default: bool = False) -> bool:
+	"""Parse a boolean environment variable."""
+	raw = os.environ.get(name, "").strip().lower()
+	if not raw:
+		return default
+	return raw in {"1", "true", "yes", "on"}
+
+
+def get_env_first(*names: str) -> str:
+	"""Return the first non-empty environment variable from the provided names."""
+	for name in names:
+		raw = os.environ.get(name, "").strip()
+		if raw:
+			return raw
+	return ""
+
+
+def parse_cookie_expiry(value: Any) -> Optional[int]:
+	"""Parse a cookie expiry timestamp from JSON-compatible values."""
+	if value is None:
+		return None
+	if isinstance(value, (int, float)):
+		return int(value)
+	if isinstance(value, str):
+		raw = value.strip()
+		if not raw:
+			return None
+		try:
+			return int(float(raw))
+		except ValueError:
+			pass
+		try:
+			return int(datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp())
+		except ValueError:
+			pass
+		try:
+			dt = parsedate_to_datetime(raw)
+			if dt.tzinfo is None:
+				dt = dt.replace(tzinfo=timezone.utc)
+			return int(dt.timestamp())
+		except Exception:
+			return None
+	return None
+
+
+def load_cookies_json_with_meta(path: str) -> tuple[Dict[str, str], Dict[str, Dict[str, Any]]]:
+	"""Load a cookies.json file in Gemini-API CLI-compatible formats."""
+	data = json.loads(Path(path).read_text(encoding="utf-8"))
+	cookies: Dict[str, str] = {}
+	meta: Dict[str, Dict[str, Any]] = {}
+
+	def upsert(name: Any, value: Any, expires_raw: Any = None):
+		if not isinstance(name, str) or not name:
+			return
+		if not isinstance(value, str) or not value:
+			return
+		cookies[name] = value
+		exp = parse_cookie_expiry(expires_raw)
+		meta[name] = {
+			"expires_raw": expires_raw,
+			"expires_epoch": exp,
+			"expires_iso": datetime.fromtimestamp(exp, tz=timezone.utc).isoformat().replace("+00:00", "Z") if exp is not None else None,
+		}
+
+	def handle_obj(item: Dict[str, Any]):
+		expires_raw = item.get("expirationDate") or item.get("expires") or item.get("expiry") or item.get("expiresDate")
+		upsert(item.get("name"), item.get("value"), expires_raw=expires_raw)
+
+	if isinstance(data, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in data.items()):
+		for k, v in data.items():
+			upsert(k, v)
+		return cookies, meta
+
+	if isinstance(data, dict) and isinstance(data.get("cookies"), dict):
+		inner = data["cookies"]
+		if all(isinstance(v, str) for v in inner.values()):
+			for k, v in inner.items():
+				upsert(k, v)
+			return cookies, meta
+
+	if isinstance(data, dict) and isinstance(data.get("cookies"), list):
+		for item in data["cookies"]:
+			if isinstance(item, dict):
+				handle_obj(item)
+		if cookies:
+			return cookies, meta
+
+	if isinstance(data, list):
+		for item in data:
+			if isinstance(item, dict):
+				handle_obj(item)
+		if cookies:
+			return cookies, meta
+
+	raise ValueError("Unsupported cookies.json format")
+
+
+def load_configured_cookie_inputs() -> tuple[str, str, Dict[str, str]]:
+	"""Load auth cookies from env and optional cookies.json."""
+	json_cookies: Dict[str, str] = {}
+	if COOKIES_JSON_PATH:
+		try:
+			json_cookies, _ = load_cookies_json_with_meta(COOKIES_JSON_PATH)
+		except FileNotFoundError:
+			logger.warning("COOKIES_JSON_PATH not found: %s", COOKIES_JSON_PATH)
+		except Exception as e:
+			logger.warning("Failed to load COOKIES_JSON_PATH=%s: %s", COOKIES_JSON_PATH, e)
+
+	psid = SECURE_1PSID or GEMINI_SECURE_1PSID or json_cookies.get("__Secure-1PSID", "")
+	psidts = SECURE_1PSIDTS or GEMINI_SECURE_1PSIDTS or json_cookies.get("__Secure-1PSIDTS", "")
+	extra = {k: v for k, v in json_cookies.items() if k not in {"__Secure-1PSID", "__Secure-1PSIDTS"}}
+	return psid, psidts, extra
+
+
+def load_cached_cookie_records(psid: str = "") -> List[Dict[str, Any]]:
+	"""Load cached full Google cookies saved by gemini-webapi."""
+	candidates: List[Path] = []
+	cache_root = Path(GEMINI_COOKIE_PATH)
+	if psid:
+		candidates.append(cache_root / f".cached_cookies_{psid}.json")
+	else:
+		try:
+			candidates.extend(sorted(cache_root.glob(".cached_cookies_*.json"), key=lambda p: p.stat().st_mtime, reverse=True))
+		except Exception:
+			return []
+
+	for path in candidates:
+		if not path.is_file():
+			continue
+		try:
+			data = json.loads(path.read_text(encoding="utf-8"))
+		except Exception as e:
+			logger.warning("Failed to parse cached cookies file %s: %s", path, e)
+			continue
+		if not isinstance(data, list):
+			continue
+		records: List[Dict[str, Any]] = []
+		for item in data:
+			if not isinstance(item, dict):
+				continue
+			name = item.get("name")
+			value = item.get("value")
+			if not isinstance(name, str) or not name or not isinstance(value, str) or not value:
+				continue
+			expires = parse_cookie_expiry(item.get("expires"))
+			if expires is not None and expires < time.time():
+				continue
+			records.append(item)
+		if records:
+			return records
+	return []
+
+
+def is_google_cookie_domain(domain: str) -> bool:
+	"""Return True for google.com/googleusercontent.com cookie domains."""
+	normalized = (domain or "").lstrip(".").lower()
+	return normalized == "google.com" or normalized.endswith(".google.com") or normalized == "googleusercontent.com" or normalized.endswith(".googleusercontent.com")
+
+
+def merge_cookies_into_httpx_jar(jar: httpx.Cookies, cookies: Any):
+	"""Copy runtime cookies into an httpx jar for proxy/download use."""
+	if not cookies:
+		return
+	if hasattr(cookies, "jar"):
+		for cookie in cookies.jar:
+			name = getattr(cookie, "name", "")
+			value = getattr(cookie, "value", "")
+			domain = getattr(cookie, "domain", "") or ".google.com"
+			path = getattr(cookie, "path", "") or "/"
+			if not name or not value or not is_google_cookie_domain(domain):
+				continue
+			jar.set(name, value, domain=domain, path=path)
+		return
+	if isinstance(cookies, dict):
+		for name, value in cookies.items():
+			if name and value:
+				jar.set(name, value, domain=".google.com", path="/")
+
+
+def merge_cookie_records_into_httpx_jar(jar: httpx.Cookies, records: List[Dict[str, Any]]):
+	"""Copy persisted cookie records into an httpx jar."""
+	for record in records:
+		name = record.get("name")
+		value = record.get("value")
+		domain = record.get("domain", ".google.com") or ".google.com"
+		path = record.get("path", "/") or "/"
+		if not isinstance(name, str) or not name or not isinstance(value, str) or not value:
+			continue
+		if not is_google_cookie_domain(domain):
+			continue
+		jar.set(name, value, domain=domain, path=path)
+
+
+def persist_cookies_json_from_client(client: Optional[GeminiClient]):
+	"""Persist refreshed runtime cookies back to COOKIES_JSON_PATH when configured."""
+	if client is None or not COOKIES_JSON_PATH:
+		return
+
+	try:
+		original, _ = load_cookies_json_with_meta(COOKIES_JSON_PATH)
+	except FileNotFoundError:
+		original = {}
+	except Exception as e:
+		logger.warning("Failed to reload COOKIES_JSON_PATH=%s before persist: %s", COOKIES_JSON_PATH, e)
+		original = {}
+
+	merged = dict(original)
+	runtime_cookies = getattr(client, "cookies", None)
+	if not runtime_cookies or not hasattr(runtime_cookies, "jar"):
+		return
+
+	for cookie in runtime_cookies.jar:
+		name = getattr(cookie, "name", None)
+		value = getattr(cookie, "value", None)
+		domain = getattr(cookie, "domain", "") or ""
+		if not isinstance(name, str) or not name or not isinstance(value, str) or not value:
+			continue
+		if not is_google_cookie_domain(domain):
+			continue
+		merged[name] = value
+
+	if merged == original:
+		return
+
+	try:
+		path = Path(COOKIES_JSON_PATH)
+		path.parent.mkdir(parents=True, exist_ok=True)
+		payload = {
+			"updated_at": datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z"),
+			"cookies": dict(sorted(merged.items())),
+		}
+		path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+		try:
+			path.chmod(0o600)
+		except Exception:
+			pass
+	except Exception as e:
+		logger.warning("Failed to persist COOKIES_JSON_PATH=%s: %s", COOKIES_JSON_PATH, e)
+
+
 def get_cached_1psidts_path(psid: str) -> str:
 	"""Return the cache path for a rotated 1PSIDTS value."""
 	if not psid or not re.match("^[\\w\\-\\.]+$", psid):
@@ -124,13 +383,14 @@ def save_cached_1psidts(psid: str, psidts: str):
 
 
 def sync_cached_1psidts_from_client(client: Optional[GeminiClient], psid: str = ""):
-	"""Save the runtime 1PSIDTS from the live Gemini client into the legacy cache file."""
+	"""Save refreshed cookie artifacts from the live Gemini client."""
 	if client is None:
 		return
 	runtime_psid = get_cookie_value(getattr(client, "cookies", None), "__Secure-1PSID") or psid or SECURE_1PSID
 	runtime_psidts = get_cookie_value(getattr(client, "cookies", None), "__Secure-1PSIDTS")
 	if runtime_psid and runtime_psidts:
 		save_cached_1psidts(runtime_psid, runtime_psidts)
+	persist_cookies_json_from_client(client)
 
 
 def get_cookie_value(cookies, name: str) -> str:
@@ -164,12 +424,16 @@ app.add_middleware(
 # Authentication credentials
 SECURE_1PSID = os.environ.get("SECURE_1PSID", "")
 SECURE_1PSIDTS = os.environ.get("SECURE_1PSIDTS", "")
+GEMINI_SECURE_1PSID = os.environ.get("GEMINI_SECURE_1PSID", "")
+GEMINI_SECURE_1PSIDTS = os.environ.get("GEMINI_SECURE_1PSIDTS", "")
+COOKIES_JSON_PATH = get_env_first("COOKIES_JSON_PATH", "GEMINI_COOKIES_JSON")
+GEMINI_SKIP_VERIFY = get_env_bool("GEMINI_SKIP_VERIFY", False)
 API_KEY = os.environ.get("API_KEY", "")
 ENABLE_THINKING = os.environ.get("ENABLE_THINKING", "false").lower() == "true"
 TEMPORARY_CHAT = os.environ.get("TEMPORARY_CHAT", "false").lower() == "true"
 AUTO_DELETE_CHAT = os.environ.get("AUTO_DELETE_CHAT", "false").lower() == "true" and not TEMPORARY_CHAT
 GEMINI_MAX_CONCURRENT = get_env_int("GEMINI_MAX_CONCURRENT", 1, minimum=1)
-PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+PUBLIC_BASE_URL = get_env_base_url("PUBLIC_BASE_URL")
 SECRET_FILE_PATH = os.path.join(os.path.dirname(__file__), "secrets", "proxy_secret")
 GEMINI_COOKIE_PATH = os.path.join(os.path.dirname(__file__), "secrets")
 SESSION_VALIDATION_PROMPT = "Reply with exactly OK."
@@ -417,22 +681,26 @@ def remove_gemini_watermark(image_bytes: bytes) -> bytes:
 		return image_bytes
 
 
-if not SECURE_1PSID or not SECURE_1PSIDTS:
-	logger.warning("Gemini credentials are missing; set SECURE_1PSID and SECURE_1PSIDTS before serving requests.")
+if not (SECURE_1PSID or GEMINI_SECURE_1PSID or COOKIES_JSON_PATH):
+	logger.warning("Gemini credentials are not explicitly configured; init will fall back to gemini-webapi cache/browser discovery if available.")
 else:
 	logger.info(
-		"Startup config: thinking=%s temporary_chat=%s auto_delete_chat=%s max_concurrent=%s public_base_url=%s gemini_webapi=%s",
+		"Startup config: thinking=%s temporary_chat=%s auto_delete_chat=%s max_concurrent=%s public_base_url=%s cookies_json=%s gemini_webapi=%s",
 		ENABLE_THINKING,
 		TEMPORARY_CHAT,
 		AUTO_DELETE_CHAT,
 		GEMINI_MAX_CONCURRENT,
 		bool(PUBLIC_BASE_URL),
+		bool(COOKIES_JSON_PATH),
 		get_gemini_webapi_version(),
 	)
-	if not re.match("^[\\w\\-\\.]+$", SECURE_1PSID):
+	configured_psid = SECURE_1PSID or GEMINI_SECURE_1PSID
+	if configured_psid and not re.match("^[\\w\\-\\.]+$", configured_psid):
 		logger.warning(
 			"SECURE_1PSID contains characters outside the safe cache filename pattern. This may be valid for auth, but cached 1PSIDTS lookup will fall back to the env value."
 		)
+	if COOKIES_JSON_PATH and not Path(COOKIES_JSON_PATH).exists():
+		logger.warning("COOKIES_JSON_PATH does not exist yet: %s", COOKIES_JSON_PATH)
 
 if not API_KEY:
 	logger.info("API key authentication is disabled.")
@@ -703,6 +971,14 @@ def map_model_name(openai_model_name: str, runtime_models: Optional[List[Any]] =
 	"""Map an OpenAI-style model name onto a Gemini enum/runtime model."""
 	normalized_openai_model_name = (openai_model_name or "").lower().strip()
 
+	# 先处理显式静态模型名，避免 runtime 列表异常稀疏时把 pro/plus/advanced 误降级成 flash。
+	for m in Model:
+		if m is Model.UNSPECIFIED:
+			continue
+		model_name = (m.model_name if hasattr(m, "model_name") else str(m)).lower()
+		if normalized_openai_model_name == model_name:
+			return m
+
 	if runtime_models:
 		best_model = None
 		best_score = -1
@@ -832,45 +1108,46 @@ async def get_gemini_client():
 			return gemini_client
 
 		try:
-			psid = SECURE_1PSID
-			cached_psidts = load_cached_1psidts(psid)
-			attempts = []
+			psid, configured_psidts, extra_cookies = load_configured_cookie_inputs()
+			cached_psidts = load_cached_1psidts(psid) if psid else ""
+			attempts: List[tuple[str, str, str, Dict[str, str]]] = []
+			if psid or configured_psidts or extra_cookies:
+				attempts.append(("configured", psid, configured_psidts, extra_cookies))
+			if psid and cached_psidts:
+				attempts.append(("legacy-cache", psid, cached_psidts, extra_cookies))
+			attempts.append(("automatic", psid, "", extra_cookies))
 
-			if cached_psidts:
-				attempts.append(("cache", cached_psidts))
-			if SECURE_1PSIDTS:
-				attempts.append(("environment", SECURE_1PSIDTS))
-
-			seen_psidts = set()
-			new_attempts = []
-			for source, psidts in attempts:
-				if not psidts or psidts in seen_psidts:
-					continue
-				seen_psidts.add(psidts)
-				new_attempts.append((source, psidts))
-			attempts = new_attempts
-
-			if not attempts:
-				raise HTTPException(
-					status_code=500,
-					detail="Missing SECURE_1PSIDTS and no cached rotated 1PSIDTS is available",
+			deduped_attempts: List[tuple[str, str, str, Dict[str, str]]] = []
+			seen = set()
+			for source, attempt_psid, attempt_psidts, attempt_extra in attempts:
+				key = (
+					attempt_psid or "",
+					attempt_psidts or "",
+					tuple(sorted(attempt_extra.items())),
 				)
+				if key in seen:
+					continue
+				seen.add(key)
+				deduped_attempts.append((source, attempt_psid, attempt_psidts, attempt_extra))
+			attempts = deduped_attempts
 
 			last_error = None
-			for source, psidts in attempts:
+			for source, attempt_psid, attempt_psidts, attempt_extra in attempts:
 				tmp_client = None
 				try:
 					logger.info("Initializing Gemini client using %s credentials", source)
 
-					tmp_client = GeminiClient(psid, psidts)
+					tmp_client = GeminiClient(attempt_psid or None, attempt_psidts or None, verify=not GEMINI_SKIP_VERIFY)
+					if attempt_extra:
+						tmp_client.cookies = attempt_extra
 					await tmp_client.init(timeout=300, auto_refresh=True, refresh_interval=600)
-					sync_cached_1psidts_from_client(tmp_client, psid)
+					sync_cached_1psidts_from_client(tmp_client, attempt_psid or psid)
 
 					gemini_client = tmp_client
 					break
 				except Exception as e:
 					last_error = e
-					logger.warning(f"Gemini session setup failed using {source} 1PSIDTS: {e}")
+					logger.warning(f"Gemini session setup failed using {source} credentials: {e}")
 					if tmp_client is not None:
 						try:
 							await tmp_client.close()
@@ -1247,12 +1524,24 @@ def validate_proxy_target(url: str):
 
 def build_proxy_cookie_jar() -> httpx.Cookies:
 	jar = httpx.Cookies()
-	psid = SECURE_1PSID
-	psidts = get_cookie_value(getattr(gemini_client, "cookies", None), "__Secure-1PSIDTS") or load_cached_1psidts(psid) or SECURE_1PSIDTS
-	jar.set("__Secure-1PSID", psid, domain=".google.com")
-	jar.set("__Secure-1PSIDTS", psidts, domain=".google.com")
-	jar.set("__Secure-1PSID", psid, domain=".googleusercontent.com")
-	jar.set("__Secure-1PSIDTS", psidts, domain=".googleusercontent.com")
+	merge_cookies_into_httpx_jar(jar, getattr(gemini_client, "cookies", None))
+
+	psid, configured_psidts, _ = load_configured_cookie_inputs()
+	if not get_cookie_value(jar, "__Secure-1PSID"):
+		merge_cookie_records_into_httpx_jar(jar, load_cached_cookie_records(psid))
+
+	psid = get_cookie_value(jar, "__Secure-1PSID") or psid
+	psidts = (
+		get_cookie_value(jar, "__Secure-1PSIDTS")
+		or load_cached_1psidts(psid)
+		or configured_psidts
+	)
+	if psid:
+		jar.set("__Secure-1PSID", psid, domain=".google.com", path="/")
+		jar.set("__Secure-1PSID", psid, domain=".googleusercontent.com", path="/")
+	if psidts:
+		jar.set("__Secure-1PSIDTS", psidts, domain=".google.com", path="/")
+		jar.set("__Secure-1PSIDTS", psidts, domain=".googleusercontent.com", path="/")
 	return jar
 
 
